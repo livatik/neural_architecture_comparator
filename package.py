@@ -9,7 +9,7 @@ dist_pypi_dir = os.path.join(dist_dir, "pypi")
 
 def _build():
     import shutil
-    source_dir = os.path.join(root_dir, "source")
+    source_dir = os.path.join(root_dir, "docs")
     shutil.rmtree(os.path.join(source_dir, "__pycache__"), ignore_errors=True)
     shutil.rmtree(dist_pypi_dir, ignore_errors=True)
     shutil.copytree(source_dir, os.path.join(dist_pypi_dir, "netron"))

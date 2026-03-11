@@ -38,7 +38,7 @@
             "justMyCode": true,
             "pathMappings": [
                 {
-                    "localRoot": "${workspaceFolder}/source",
+                    "localRoot": "${workspaceFolder}/docs",
                     "remoteRoot": "${workspaceFolder}/dist/pypi/netron",
                 }
             ],
@@ -46,7 +46,7 @@
                 "action": "debugWithChrome",
                 "pattern": "Serving .*at http://localhost:([0-9]+)",
                 "uriFormat": "http://localhost:%s",
-                "webRoot": "${workspaceFolder}/source",
+                "webRoot": "${workspaceFolder}/docs",
             },
         },
         {
