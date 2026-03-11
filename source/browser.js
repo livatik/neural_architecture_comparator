@@ -28,7 +28,7 @@ browser.Host = class {
             packaged: this._meta.version && this._meta.version[0] !== '0.0.0',
             platform: /(Mac|iPhone|iPod|iPad)/i.test(this._navigator.platform) ? 'darwin' : undefined,
             agent: this._navigator.userAgent.toLowerCase().indexOf('safari') !== -1 && this._navigator.userAgent.toLowerCase().indexOf('chrome') === -1 ? 'safari' : '',
-            // repository: this._element('logo-github').getAttribute('href'),
+            repository: this._element('github-ref').getAttribute('href'),
             menu: true
         };
         if (this.version && !/^\d+\.\d+\.\d+$/.test(this.version)) {

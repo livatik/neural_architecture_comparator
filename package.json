@@ -1,16 +1,15 @@
 {
-    "name": "netron",
-    "productName": "Netron",
+    "name": "netcompare",
+    "productName": "Netcompare",
     "author": {
-        "name": "Lutz Roeder",
-        "email": "lutzroeder@users.noreply.github.com",
-        "url": "https://www.lutzroeder.com"
+        "name": "Livatik",
+        "email": "livatik@users.noreply.github.com"
     },
-    "version": "8.9.2",
-    "date": "2026-02-27 18:12:45",
-    "description": "Visualizer for neural network, deep learning, and machine learning models",
+    "version": "0.0.1",
+    "date": "2026-03-09 18:12:45",
+    "description": "Visualizer for comparing neural network, deep learning, and machine learning models",
     "license": "MIT",
-    "repository": "lutzroeder/netron",
+    "repository": "livatik/netcompare",
     "type": "module",
     "main": "source/app.js",
     "scripts": {
