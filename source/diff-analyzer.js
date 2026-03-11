@@ -146,7 +146,7 @@ diffAnalyser.ModelNodesDiffAnalyzer = class {
 
     static _isTensorValue(value) {
         // Tensor has name, quantization and initializer
-        return "name" in value && "quantization" in value && "initializer" in value;
+        return "name" in value && "initializer" in value;
     }
 
     static _isInputTensorValue(value) {
