@@ -1349,3 +1349,4 @@ diffAnalyser.PropertyDiffAnalyzer = class {
 export const ModelNodesDiffAnalyzer = diffAnalyser.ModelNodesDiffAnalyzer;
 export const GraphDiffAnalyzer = diffAnalyser.GraphDiffAnalyzer;
 export const ModelDiffAnalyzer = diffAnalyser.ModelDiffAnalyzer;
+export const ModelDifferences = diffAnalyser.ModelDifferences;

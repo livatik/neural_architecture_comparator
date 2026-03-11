@@ -244,8 +244,12 @@ browser.Host = class {
                     const model2Paths = this._modelPaths.input2;
                     model2 = await this._open(model2Paths, 'model-right');
                 }
-
-                const differences = diffAnalyzer.ModelNodesDiffAnalyzer.compare(model1, model2);
+                let differences = null;
+                try {
+                    differences = diffAnalyzer.ModelNodesDiffAnalyzer.compare(model1, model2);
+                } catch (error) {
+                    differences = diffAnalyzer.ModelDifferences([])
+                }
                 this._view.setDifferences(differences);
                 
                 if( model1 !== null) {
