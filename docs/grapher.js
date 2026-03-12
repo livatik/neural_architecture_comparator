@@ -617,27 +617,34 @@ grapher.Node.Header.Entry = class {
                     if (!slavePanel) return;
 
                     // Compute scroll delta so that slave node appears at the same relative
-                    // vertical offset as the master node within their respective panel viewports.
-
-                    const masterNodeRect = masterNode.getBoundingClientRect();
-                    const slaveNodeRect  = slaveNode.getBoundingClientRect();
+                    // vertical and horizontal offset as the master node within their respective panel viewports.
+                    const masterNodeRect  = masterNode.getBoundingClientRect();
+                    const slaveNodeRect   = slaveNode.getBoundingClientRect();
                     const masterPanelRect = masterPanel.getBoundingClientRect();
                     const slavePanelRect  = slavePanel.getBoundingClientRect();
 
                     // Relative positions inside their scroll containers (viewports)
-                    const masterRelTop = masterNodeRect.top - masterPanelRect.top;
-                    const slaveRelTop  = slaveNodeRect.top  - slavePanelRect.top;
+                    const masterRelTop  = masterNodeRect.top  - masterPanelRect.top;
+                    const slaveRelTop   = slaveNodeRect.top   - slavePanelRect.top;
+                    const masterRelLeft = masterNodeRect.left - masterPanelRect.left;
+                    const slaveRelLeft  = slaveNodeRect.left  - slavePanelRect.left;
 
-                    // Amount to move the slave panel so the slave node lines up with the master's relative top
-                    const delta = slaveRelTop - masterRelTop;
-                    const nextScrollTop = Math.max(0, slavePanel.scrollTop + delta);
+                    // Amount to move the slave panel so the slave node lines up with the master's relative offsets
+                    const deltaY = slaveRelTop  - masterRelTop;
+                    const deltaX = slaveRelLeft - masterRelLeft;
+
+                    const nextScrollTop  = Math.max(0, slavePanel.scrollTop  + deltaY);
+                    const nextScrollLeft = Math.max(0, slavePanel.scrollLeft + deltaX);
 
                     // Respect reduced-motion preference
                     const prefersReducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
+
                     slavePanel.scrollTo({
                         top: nextScrollTop,
+                        left: nextScrollLeft,
                         behavior: prefersReducedMotion ? 'auto' : 'smooth'
                     });
+
                 });
             }
         }
