@@ -250,14 +250,10 @@ browser.Host = class {
                 } catch (error) {
                     differences = diffAnalyzer.ModelDifferences([])
                 }
+
                 this._view.setDifferences(differences);
-                
-                if( model1 !== null) {
-                    await this._render(model1, 'model-left', differences.model1NodeInfos);
-                }
-                if( model2 !== null) {
-                    await this._render(model2, 'model-right', differences.model2NodeInfos);
-                }
+
+                await this._renderPanels(model1, model2, differences);
                 
                 // this._view.enableScrollSync();
                 this._view.show(null)
@@ -557,14 +553,35 @@ browser.Host = class {
     }
 
     async _render(newModel, targetModelPanel, nodeInfos) {
-        const renderedModel = await this._view.render(newModel, targetModelPanel, nodeInfos);
-        if (renderedModel) {
-            this.document.title = renderedModel.name || renderedModel.identifier;
-            return '';
+        const renderModel = await this._view.render(newModel, targetModelPanel, nodeInfos);
+        if (renderModel) {
+            return renderModel.name || renderModel.identifier;
+        }
+        else {
+            return ""; // 'model-render-failed';
+        }
+    }
+
+    async _renderPanels(model1, model2, differences)
+    {
+        let title1 = "";
+        let title2 = "";
+        if (model1 !== null) {
+            title1 = await this._render(model1, 'model-left', differences.model1NodeInfos);
+        }
+
+        if (model2 !== null) {
+            title2 = await this._render(model2, 'model-right', differences.model2NodeInfos);
+        }
+
+        if (title1 && title2) {
+            this.document.title = `${title1} vs ${title2}`;
+        } 
+        else if (title1 || title2) {
+            this.document.title = title1 || title2;
         }
         else {
             this.document.title = '';
-            return 'model-render-failed';
         }
     }
 
