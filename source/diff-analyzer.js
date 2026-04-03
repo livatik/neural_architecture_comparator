@@ -695,13 +695,13 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
 
     static _extractAttrFeatures(node) {
         const attrs = diffAnalyser.ModelNodesDiffAnalyzer._getNodeAttributes(node);
+        const toNum = (v) => (typeof v === 'bigint') ? Number(v) : (typeof v === 'number' ? v : (Number(v) || 0));
         const get = (keys) => {
             for (const k of keys) {
                 if (attrs.has(k)) {
                     const v = attrs.get(k)?.value;
-                    if (Array.isArray(v)) return v[0] ?? 0;
-                    if (typeof v === 'number') return v;
-                    if (v !== null && v !== undefined) return Number(v) || 0;
+                    if (Array.isArray(v)) return v.length > 0 ? toNum(v[0]) : 0;
+                    if (v !== null && v !== undefined) return toNum(v);
                 }
             }
             return null;
