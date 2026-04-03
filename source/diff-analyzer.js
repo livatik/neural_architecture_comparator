@@ -604,6 +604,381 @@ diffAnalyser.ModelNodesDiffAnalyzer = class {
     }
 };
 
+diffAnalyser.SoftModelNodesDiffAnalyzer = class {
+
+    // ----------------------------- Constants -----------------------------
+    static FEATURE_DIM = 16;
+    static MESSAGE_PASS_ROUNDS = 2;
+    static SOFT_MATCH_THRESHOLD = 0.35;
+    static EXPANSION_THRESHOLD = 0.25;
+    static SELF_WEIGHT = 0.5;
+
+    // ----------------------------- Type Vocabulary -----------------------------
+
+    static _buildVocabulary(nodes1, nodes2) {
+        const typeToIdx = new Map();
+        for (const node of [...nodes1, ...nodes2]) {
+            const t = diffAnalyser.ModelNodesDiffAnalyzer._getNodeTypeName(node) ?? '__unknown__';
+            if (!typeToIdx.has(t)) {
+                typeToIdx.set(t, typeToIdx.size);
+            }
+        }
+        return { typeToIdx, size: typeToIdx.size || 1 };
+    }
+
+    static _buildCompatibilityGroups(vocab) {
+        const groups = new Int32Array(vocab.size);
+        const rules = [
+            [/^conv/i,           0],
+            [/^batchnorm|^bn$/i, 1],
+            [/^relu|^activation|^sigmoid|^tanh|^elu|^leaky/i, 2],
+            [/^pool/i,           3],
+            [/^linear|^dense|^gemm|^matmul|^fc$/i, 4],
+            [/^add$|^mul$|^concat|^merge|^elementwise/i, 5],
+        ];
+        for (const [typeName, idx] of vocab.typeToIdx) {
+            let group = 99;
+            for (const [re, g] of rules) {
+                if (re.test(typeName)) { group = g; break; }
+            }
+            groups[idx] = group;
+        }
+        return groups;
+    }
+
+    // ----------------------------- Graph Topology -----------------------------
+
+    static _buildTopology(nodes, edges) {
+        const MNA = diffAnalyser.ModelNodesDiffAnalyzer;
+        const parentMap = new Map();
+        const childMap  = new Map();
+        const inDegree  = new Map();
+        const outDegree = new Map();
+
+        for (const node of nodes) {
+            const parents  = MNA._getParentNodes(node, edges).filter(p => !(p instanceof diffAnalyser.StartNode));
+            const children = MNA._getChildNodes(node, edges).filter(c => !(c instanceof diffAnalyser.StartNode));
+            parentMap.set(node, parents);
+            childMap.set(node,  children);
+            inDegree.set(node,  parents.length);
+            outDegree.set(node, children.length);
+        }
+
+        // Kahn's BFS topological ranking
+        const topoRank = new Map();
+        const pending  = new Map(nodes.map(n => [n, parentMap.get(n).filter(p => nodes.includes(p)).length]));
+        let queue = nodes.filter(n => pending.get(n) === 0);
+        let rank  = 0;
+        while (queue.length > 0) {
+            const next = [];
+            for (const node of queue) {
+                topoRank.set(node, rank);
+                for (const child of (childMap.get(node) ?? [])) {
+                    if (!pending.has(child)) continue;
+                    const cnt = pending.get(child) - 1;
+                    pending.set(child, cnt);
+                    if (cnt === 0) next.push(child);
+                }
+            }
+            rank++;
+            queue = next;
+        }
+        // Nodes unreachable (cycles) get rank 0
+        for (const node of nodes) {
+            if (!topoRank.has(node)) topoRank.set(node, 0);
+        }
+
+        return { parentMap, childMap, inDegree, outDegree, topoRank };
+    }
+
+    // ----------------------------- Feature Vectors -----------------------------
+
+    static _extractAttrFeatures(node) {
+        const attrs = diffAnalyser.ModelNodesDiffAnalyzer._getNodeAttributes(node);
+        const get = (keys) => {
+            for (const k of keys) {
+                if (attrs.has(k)) {
+                    const v = attrs.get(k)?.value;
+                    if (Array.isArray(v)) return v[0] ?? 0;
+                    if (typeof v === 'number') return v;
+                    if (v !== null && v !== undefined) return Number(v) || 0;
+                }
+            }
+            return null;
+        };
+        const ks  = get(['kernel_shape', 'kernel_size', 'filter_shape']);
+        const ks0 = Array.isArray(ks) ? (ks[0] ?? 0) : (ks ?? 0);
+        const ks1 = Array.isArray(ks) ? (ks[1] ?? ks[0] ?? 0) : (ks ?? 0);
+        const stride    = get(['strides', 'stride']);
+        const outCh     = get(['out_channels', 'num_output', 'num_filters', 'filters']);
+        const groups    = get(['group', 'groups']);
+        return { ks0, ks1, stride, outCh, groups, attrCount: attrs.size };
+    }
+
+    static _buildFeatureVectors(nodes, topo, vocab) {
+        const DIM    = this.FEATURE_DIM;
+        const maxDeg = Math.max(1, ...nodes.map(n => Math.max(topo.inDegree.get(n) ?? 0, topo.outDegree.get(n) ?? 0)));
+        const maxRank = Math.max(1, ...[...topo.topoRank.values()]);
+        const fmap = new Map();
+
+        for (const node of nodes) {
+            const vec = new Float32Array(DIM);
+            const typeName = diffAnalyser.ModelNodesDiffAnalyzer._getNodeTypeName(node) ?? '__unknown__';
+            const typeIdx  = vocab.typeToIdx.get(typeName) ?? 0;
+            const { ks0, ks1, stride, outCh, groups, attrCount } = this._extractAttrFeatures(node);
+
+            vec[0]  = typeIdx / vocab.size;
+            vec[1]  = (topo.inDegree.get(node)  ?? 0) / maxDeg;
+            vec[2]  = (topo.outDegree.get(node) ?? 0) / maxDeg;
+            vec[3]  = (topo.topoRank.get(node)  ?? 0) / maxRank;
+            vec[4]  = ks0 !== null ? 1 : 0;
+            vec[5]  = ks0 !== null ? Math.min(ks0, 32) / 32 : 0;
+            vec[6]  = ks1 !== null ? Math.min(ks1, 32) / 32 : 0;
+            vec[7]  = stride !== null ? 1 : 0;
+            vec[8]  = stride !== null ? Math.min(stride, 8) / 8 : 0;
+            vec[9]  = outCh !== null ? 1 : 0;
+            vec[10] = outCh !== null ? Math.min(outCh, 4096) / 4096 : 0;
+            vec[11] = groups !== null ? 1 : 0;
+            vec[12] = groups !== null ? Math.min(groups, 256) / 256 : 0;
+            vec[13] = Math.min(attrCount, 20) / 20;
+            vec[14] = Math.min((node.inputs  ?? []).length, 8) / 8;
+            vec[15] = Math.min((node.outputs ?? []).length, 8) / 8;
+
+            fmap.set(node, vec);
+        }
+        return fmap;
+    }
+
+    // ----------------------------- Message Passing -----------------------------
+
+    static _messagePass(nodes, fmap, topo, rounds) {
+        const DIM  = this.FEATURE_DIM;
+        const SELF = this.SELF_WEIGHT;
+        const AGG  = 1 - SELF;
+
+        for (let r = 0; r < rounds; r++) {
+            const newMap = new Map();
+            for (const node of nodes) {
+                const selfVec = fmap.get(node);
+                const nbrs    = [...(topo.parentMap.get(node) ?? []), ...(topo.childMap.get(node) ?? [])];
+                const aggVec  = new Float32Array(DIM);
+                let   cnt     = 0;
+                for (const nbr of nbrs) {
+                    const nv = fmap.get(nbr);
+                    if (!nv) continue;
+                    for (let i = 0; i < DIM; i++) aggVec[i] += nv[i];
+                    cnt++;
+                }
+                const newVec = new Float32Array(DIM);
+                if (cnt > 0) {
+                    for (let i = 0; i < DIM; i++) newVec[i] = SELF * selfVec[i] + AGG * (aggVec[i] / cnt);
+                } else {
+                    for (let i = 0; i < DIM; i++) newVec[i] = selfVec[i];
+                }
+                newMap.set(node, newVec);
+            }
+            fmap = newMap;
+        }
+        return fmap;
+    }
+
+    // ----------------------------- Cosine Similarity + Type Mask -----------------------------
+
+    static _l2norm(vec) {
+        let s = 0;
+        for (let i = 0; i < vec.length; i++) s += vec[i] * vec[i];
+        return Math.sqrt(s);
+    }
+
+    static _buildSimilarityMatrix(nodes1, nodes2, fmap1, fmap2, compatGroups, vocab) {
+        const n1  = nodes1.length;
+        const n2  = nodes2.length;
+        const DIM = this.FEATURE_DIM;
+        const sim = new Float32Array(n1 * n2);
+
+        // Precompute norms and group for nodes2
+        const norms2  = new Float32Array(n2);
+        const groups2 = new Int32Array(n2);
+        for (let j = 0; j < n2; j++) {
+            norms2[j]  = this._l2norm(fmap2.get(nodes2[j]));
+            const tn   = diffAnalyser.ModelNodesDiffAnalyzer._getNodeTypeName(nodes2[j]) ?? '__unknown__';
+            groups2[j] = compatGroups[vocab.typeToIdx.get(tn) ?? 0] ?? 99;
+        }
+
+        for (let i = 0; i < n1; i++) {
+            const vec1   = fmap1.get(nodes1[i]);
+            const norm1  = this._l2norm(vec1);
+            const tn1    = diffAnalyser.ModelNodesDiffAnalyzer._getNodeTypeName(nodes1[i]) ?? '__unknown__';
+            const group1 = compatGroups[vocab.typeToIdx.get(tn1) ?? 0] ?? 99;
+
+            for (let j = 0; j < n2; j++) {
+                if (group1 !== groups2[j]) {
+                    // type-incompatible: hard zero
+                    sim[i * n2 + j] = 0;
+                    continue;
+                }
+                if (norm1 < 1e-9 || norms2[j] < 1e-9) {
+                    sim[i * n2 + j] = 0;
+                    continue;
+                }
+                const vec2 = fmap2.get(nodes2[j]);
+                let dot = 0;
+                for (let k = 0; k < DIM; k++) dot += vec1[k] * vec2[k];
+                sim[i * n2 + j] = dot / (norm1 * norms2[j]);
+            }
+        }
+        return sim;
+    }
+
+    // ----------------------------- Greedy Strong-First Matching -----------------------------
+
+    static _greedyMatch(nodes1, nodes2, sim, threshold) {
+        const n1 = nodes1.length;
+        const n2 = nodes2.length;
+
+        // Collect candidates above threshold
+        const candidates = [];
+        for (let i = 0; i < n1; i++) {
+            for (let j = 0; j < n2; j++) {
+                const s = sim[i * n2 + j];
+                if (s > threshold) candidates.push(i * n2 + j);  // pack i,j,s
+            }
+        }
+        // Sort descending by score
+        candidates.sort((a, b) => sim[b] - sim[a]);
+
+        const matched1    = new Set();
+        const matched2    = new Set();
+        const assignments = [];
+
+        // TODO: GW scoring boost could be inserted here for pairs with low sim score
+
+        for (const packed of candidates) {
+            const i = Math.floor(packed / n2);
+            const j = packed % n2;
+            if (matched1.has(i) || matched2.has(j)) continue;
+            assignments.push({ idx1: i, idx2: j, score: sim[packed] });
+            matched1.add(i);
+            matched2.add(j);
+        }
+
+        return { assignments, matched1, matched2 };
+    }
+
+    // ----------------------------- Local Graph Expansion -----------------------------
+
+    static _expandMatches(assignments, matched1, matched2, nodes1, nodes2, topo1, topo2, sim, n2) {
+        const THRESH = this.EXPANSION_THRESHOLD;
+
+        // Precompute node→index maps
+        const idx1Map = new Map(nodes1.map((n, i) => [n, i]));
+        const idx2Map = new Map(nodes2.map((n, i) => [n, i]));
+
+        // Build idx1→idx2 map from current assignments for neighbour lookups
+        const assignMap = new Map(assignments.map(a => [a.idx1, a.idx2]));
+
+        let changed = true;
+        while (changed) {
+            changed = false;
+            for (let i = 0; i < nodes1.length; i++) {
+                if (matched1.has(i)) continue;
+                const node1 = nodes1[i];
+                const nbrs1 = [...(topo1.parentMap.get(node1) ?? []), ...(topo1.childMap.get(node1) ?? [])];
+
+                let bestScore = THRESH;
+                let bestJ     = -1;
+
+                for (const nbr1 of nbrs1) {
+                    const nbrIdx1 = idx1Map.get(nbr1);
+                    if (nbrIdx1 === undefined || !assignMap.has(nbrIdx1)) continue;
+                    const matchedIdx2 = assignMap.get(nbrIdx1);
+                    const node2nbr    = nodes2[matchedIdx2];
+
+                    const cands2 = [...(topo2.parentMap.get(node2nbr) ?? []), ...(topo2.childMap.get(node2nbr) ?? [])];
+                    for (const cand2 of cands2) {
+                        const j = idx2Map.get(cand2);
+                        if (j === undefined || matched2.has(j)) continue;
+                        const s = sim[i * n2 + j];
+                        if (s > bestScore) { bestScore = s; bestJ = j; }
+                    }
+                }
+
+                if (bestJ !== -1) {
+                    assignments.push({ idx1: i, idx2: bestJ, score: bestScore });
+                    matched1.add(i);
+                    matched2.add(bestJ);
+                    assignMap.set(i, bestJ);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // ----------------------------- Build Output -----------------------------
+
+    static _buildModelDifferences(assignments, nodes1, nodes2) {
+        const entries = [];
+        let index = 0;
+        for (const { idx1, idx2 } of assignments) {
+            const node1          = nodes1[idx1];
+            const node2          = nodes2[idx2];
+            const nodeDifferences = diffAnalyser.NodeDiffAnalyzer.compare(node1, node2);
+            const id             = `soft-node-${index++}`;
+            entries.push(new diffAnalyser.ModelNodesDiffAnalyzerEntry(id, node1, node2, nodeDifferences));
+        }
+        return new diffAnalyser.ModelDifferences(entries);
+    }
+
+    // ----------------------------- Main Entry Point -----------------------------
+
+    static compare(model1, model2) {
+        if (model1 === null || model2 === null) {
+            return new diffAnalyser.ModelDifferences([]);
+        }
+
+        const nodes1 = model1?.modules?.[0]?.nodes ?? [];
+        const nodes2 = model2?.modules?.[0]?.nodes ?? [];
+
+        if (nodes1.length === 0 && nodes2.length === 0) {
+            return new diffAnalyser.ModelDifferences([]);
+        }
+
+        // 1. Shared type vocabulary
+        const vocab        = this._buildVocabulary(nodes1, nodes2);
+        const compatGroups = this._buildCompatibilityGroups(vocab);
+
+        // 2. Edge graphs (reuse existing infrastructure)
+        const model1Inputs    = diffAnalyser.ModelNodesDiffAnalyzer._getInputs(model1);
+        const model2Inputs    = diffAnalyser.ModelNodesDiffAnalyzer._getInputs(model2);
+        const model1StartNode = new diffAnalyser.StartNode(model1Inputs);
+        const model2StartNode = new diffAnalyser.StartNode(model2Inputs);
+        const edges1 = diffAnalyser.ModelNodesDiffAnalyzer._findEdges(model1, model1StartNode);
+        const edges2 = diffAnalyser.ModelNodesDiffAnalyzer._findEdges(model2, model2StartNode);
+
+        // 3. Topology
+        const topo1 = this._buildTopology(nodes1, edges1);
+        const topo2 = this._buildTopology(nodes2, edges2);
+
+        // 4. Feature vectors + message passing
+        let fmap1 = this._buildFeatureVectors(nodes1, topo1, vocab);
+        let fmap2 = this._buildFeatureVectors(nodes2, topo2, vocab);
+        fmap1 = this._messagePass(nodes1, fmap1, topo1, this.MESSAGE_PASS_ROUNDS);
+        fmap2 = this._messagePass(nodes2, fmap2, topo2, this.MESSAGE_PASS_ROUNDS);
+
+        // 5. Cosine similarity with type-compatibility mask
+        const sim = this._buildSimilarityMatrix(nodes1, nodes2, fmap1, fmap2, compatGroups, vocab);
+
+        // 6. Greedy strong-first matching
+        const { assignments, matched1, matched2 } = this._greedyMatch(nodes1, nodes2, sim, this.SOFT_MATCH_THRESHOLD);
+
+        // 7. Local graph expansion for unmatched nodes
+        this._expandMatches(assignments, matched1, matched2, nodes1, nodes2, topo1, topo2, sim, nodes2.length);
+
+        // 8. Build ModelDifferences output
+        return this._buildModelDifferences(assignments, nodes1, nodes2);
+    }
+};
+
 diffAnalyser.ModelNodesDiffAnalyzerEntry = class {
     constructor(nodeID, node1, node2, nodeDifferences) {
         this._nodeID = nodeID;
@@ -1347,6 +1722,7 @@ diffAnalyser.PropertyDiffAnalyzer = class {
 };
 
 export const ModelNodesDiffAnalyzer = diffAnalyser.ModelNodesDiffAnalyzer;
+export const SoftModelNodesDiffAnalyzer = diffAnalyser.SoftModelNodesDiffAnalyzer;
 export const GraphDiffAnalyzer = diffAnalyser.GraphDiffAnalyzer;
 export const ModelDiffAnalyzer = diffAnalyser.ModelDiffAnalyzer;
 export const ModelDifferences = diffAnalyser.ModelDifferences;

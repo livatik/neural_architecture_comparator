@@ -246,7 +246,7 @@ browser.Host = class {
                 }
                 let differences = null;
                 try {
-                    differences = diffAnalyzer.ModelNodesDiffAnalyzer.compare(model1, model2);
+                    differences = diffAnalyzer.SoftModelNodesDiffAnalyzer.compare(model1, model2);
                 } catch (error) {
                     differences = diffAnalyzer.ModelDifferences([])
                 }
