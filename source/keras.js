@@ -1486,4 +1486,5 @@ tfjs.Error = class extends Error {
 };
 
 export const ModelFactory = keras.ModelFactory;
+export const Node = keras.Node;
 export const Tensor = keras.Tensor;

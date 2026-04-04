@@ -1,6 +1,9 @@
 import { metrics } from './metadata.js';
 import * as keras from './keras.js';
 import * as pytorch from './pytorch.js';
+import * as onnx from './onnx.js';
+import * as tf from './tf.js';
+import * as tflite from './tflite.js';
 
 const diffAnalyser = {};
 
@@ -608,7 +611,7 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
 
     // ----------------------------- Constants -----------------------------
     static FEATURE_DIM = 16;
-    static MESSAGE_PASS_ROUNDS = 2;
+    static MESSAGE_PASS_ROUNDS = 4;
     static SOFT_MATCH_THRESHOLD = 0.35;
     static EXPANSION_THRESHOLD = 0.25;
     static SELF_WEIGHT = 0.5;
@@ -693,26 +696,283 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
 
     // ----------------------------- Feature Vectors -----------------------------
 
-    static _extractAttrFeatures(node) {
-        const attrs = diffAnalyser.ModelNodesDiffAnalyzer._getNodeAttributes(node);
+    // Helper: read dimensions from node.inputs[inputIdx].value[0].type.shape.dimensions
+    // Returns null if unavailable or dimensions has wrong rank.
+    static _weightDims(node, inputIdx) {
+        const arg = (node.inputs ?? [])[inputIdx];
+        const dims = arg?.value?.[0]?.type?.shape?.dimensions;
+        return Array.isArray(dims) && dims.length >= 2 ? dims : null;
+    }
+
+    // ONNX: attribute values are BigInt or BigInt[] (INT/INTS proto fields).
+    // kernel_shape and strides come from op attributes.
+    // Weight tensor (inputs[1]) layout: [out_ch, in_ch, kH, kW]
+    static _extractAttrFeaturesOnnx(node) {
+        const toNum = (v) => (typeof v === 'bigint') ? Number(v) : (typeof v === 'number' ? v : 0);
+        const attrs = new Map();
+        for (const a of (node.attributes ?? [])) { if (a?.name) attrs.set(a.name, a); }
+        const arr = (key) => {
+            const v = attrs.get(key)?.value;
+            if (Array.isArray(v)) return v.map(toNum);
+            if (v != null) return [toNum(v)];
+            return null;
+        };
+        const scalar = (key) => { const a = arr(key); return a ? a[0] : null; };
+        const ks = arr('kernel_shape');
+        const st = arr('strides');
+
+        // kernel_shape is explicit for Conv; for Pool it may be absent — fall back to weight tensor
+        let ks0 = ks ? ks[0] : null;
+        let ks1 = ks ? (ks[1] ?? ks[0]) : null;
+        let outCh = null;
+        const dims = this._weightDims(node, 1); // [out_ch, in_ch, kH, kW]
+        if (dims && dims.length >= 4) {
+            if (ks0 === null) ks0 = toNum(dims[2]);
+            if (ks1 === null) ks1 = toNum(dims[3]);
+            outCh = toNum(dims[0]);
+        }
+
+        return {
+            ks0,
+            ks1,
+            stride:    st ? st[0] : null,
+            outCh,
+            groups:    scalar('group'),
+            attrCount: attrs.size,
+        };
+    }
+
+    // PyTorch: numeric params live in node.inputs (not node.attributes).
+    // Weight tensor (inputs[1]) layout: [out_ch, in_ch/groups, kH, kW]
+    static _extractAttrFeaturesPytorch(node) {
         const toNum = (v) => (typeof v === 'bigint') ? Number(v) : (typeof v === 'number' ? v : (Number(v) || 0));
-        const get = (keys) => {
+        const attrs = diffAnalyser.ModelNodesDiffAnalyzer._getPyTorchAttributes(node);
+        const first = (keys) => {
             for (const k of keys) {
-                if (attrs.has(k)) {
-                    const v = attrs.get(k)?.value;
-                    if (Array.isArray(v)) return v.length > 0 ? toNum(v[0]) : 0;
-                    if (v !== null && v !== undefined) return toNum(v);
-                }
+                const v = attrs.get(k)?.value;
+                if (v == null) continue;
+                if (Array.isArray(v) && v.length > 0) return toNum(v[0]);
+                return toNum(v);
             }
             return null;
         };
-        const ks  = get(['kernel_shape', 'kernel_size', 'filter_shape']);
-        const ks0 = Array.isArray(ks) ? (ks[0] ?? 0) : (ks ?? 0);
-        const ks1 = Array.isArray(ks) ? (ks[1] ?? ks[0] ?? 0) : (ks ?? 0);
-        const stride    = get(['strides', 'stride']);
-        const outCh     = get(['out_channels', 'num_output', 'num_filters', 'filters']);
-        const groups    = get(['group', 'groups']);
-        return { ks0, ks1, stride, outCh, groups, attrCount: attrs.size };
+        const arr = (keys) => {
+            for (const k of keys) {
+                const v = attrs.get(k)?.value;
+                if (v == null) continue;
+                if (Array.isArray(v)) return v.map(toNum);
+                return [toNum(v)];
+            }
+            return null;
+        };
+        const ks = arr(['kernel_size', 'kernel_sizes']);
+
+        let ks0   = ks ? ks[0] : null;
+        let ks1   = ks ? (ks[1] ?? ks[0]) : null;
+        let outCh = first(['out_channels', 'out_features', 'num_features']);
+
+        // Fall back to weight tensor shape for ops without explicit attribute params
+        const dims = this._weightDims(node, 1); // [out_ch, in_ch/groups, kH, kW]
+        if (dims && dims.length >= 4) {
+            if (ks0   === null) ks0   = toNum(dims[2]);
+            if (ks1   === null) ks1   = toNum(dims[3]);
+            if (outCh === null) outCh = toNum(dims[0]);
+        }
+
+        return {
+            ks0,
+            ks1,
+            stride: first(['stride', 'strides']),
+            outCh,
+            groups: first(['groups', 'group']),
+            attrCount: attrs.size,
+        };
+    }
+
+    // TFLite: builtin_options are decoded as flat scalars via tflite-schema.js.
+    // Attribute names by op:
+    //   Conv2D / TransposeConv: stride_w, stride_h, dilation_w_factor, dilation_h_factor
+    //   DepthwiseConv2D:        stride_w, stride_h, dilation_w_factor, dilation_h_factor, depth_multiplier
+    //   Pool2D (Avg/Max):       stride_w, stride_h, filter_width, filter_height
+    // Filter size for Conv ops is stored in the weight tensor shape (inputs[1]):
+    //   Conv2D weight layout:         [out_channels, kH, kW, in_channels]
+    //   DepthwiseConv2D weight layout: [1, kH, kW, depth_multiplier]
+    static _extractAttrFeaturesTflite(node) {
+        const toNum = (v) => (typeof v === 'bigint') ? Number(v) : (typeof v === 'number' ? v : (Number(v) || 0));
+        const attrs = new Map();
+        for (const a of (node.attributes ?? [])) { if (a?.name) attrs.set(a.name, a); }
+        const scalar = (keys) => {
+            for (const k of keys) {
+                const v = attrs.get(k)?.value;
+                if (v != null && v !== 0) return toNum(v);
+            }
+            return null;
+        };
+
+        // Pool ops expose kernel size directly as attributes
+        let ks0 = scalar(['filter_height']);
+        let ks1 = scalar(['filter_width']);
+        let outCh = scalar(['depth_multiplier']);
+
+        // Conv ops: read kernel size and output channels from weight tensor shape (inputs[1])
+        if (ks0 === null || ks1 === null || outCh === null) {
+            const weightArg = (node.inputs ?? [])[1];
+            const dims = weightArg?.value?.[0]?.type?.shape?.dimensions;
+            if (Array.isArray(dims) && dims.length === 4) {
+                // [out_channels, kH, kW, in_channels] for Conv2D
+                // [1, kH, kW, depth_multiplier] for DepthwiseConv2D
+                if (ks0 === null) ks0 = toNum(dims[1]);
+                if (ks1 === null) ks1 = toNum(dims[2]);
+                if (outCh === null) outCh = toNum(dims[0]);
+            }
+        }
+
+        return {
+            ks0,
+            ks1,
+            stride: scalar(['stride_w', 'stride_h']),
+            outCh,
+            groups: null,
+            attrCount: attrs.size,
+        };
+    }
+
+    // TF/PB: strides and ksize stored as NHWC lists [1, h, w, 1].
+    // Filter tensor (inputs[1]) layout: [kH, kW, in_ch, out_ch]
+    static _extractAttrFeaturesTf(node) {
+        const toNum = (v) => {
+            if (typeof v === 'bigint') return Number(v);
+            if (typeof v === 'number') return v;
+            if (v === '?') return 0;
+            return Number(v) || 0;
+        };
+        const attrs = new Map();
+        for (const a of (node.attributes ?? [])) { if (a?.name) attrs.set(a.name, a); }
+        const nhwcIdx = (key, idx) => {
+            const v = attrs.get(key)?.value;
+            if (Array.isArray(v) && v.length > idx) return toNum(v[idx]);
+            if (v?.dimensions && v.dimensions.length > idx) return toNum(v.dimensions[idx]);
+            return null;
+        };
+
+        // strides/ksize format is [1, h, w, 1] (NHWC); index 1 = height, 2 = width
+        let ks0   = nhwcIdx('ksize', 1);
+        let ks1   = nhwcIdx('ksize', 2);
+        let outCh = null;
+
+        // Filter weight tensor (inputs[1]): [kH, kW, in_ch, out_ch]
+        const dims = this._weightDims(node, 1);
+        if (dims && dims.length >= 4) {
+            if (ks0   === null) ks0   = toNum(dims[0]);
+            if (ks1   === null) ks1   = toNum(dims[1]);
+            outCh = toNum(dims[3]);
+        }
+
+        return {
+            ks0,
+            ks1,
+            stride: nhwcIdx('strides', 1),
+            outCh,
+            groups: null,
+            attrCount: attrs.size,
+        };
+    }
+
+    // Keras: kernel_size, strides, filters come from the layer config (JSON attributes).
+    // Kernel weight tensor (inputs[1]) layout: [kH, kW, in_ch, out_ch]
+    // Config attributes are preferred; weight tensor is a fallback for custom layers.
+    static _extractAttrFeaturesKeras(node) {
+        const toNum = (v) => (typeof v === 'bigint') ? Number(v) : (typeof v === 'number' ? v : (Number(v) || 0));
+        const attrs = new Map();
+        for (const a of (node.attributes ?? [])) { if (a?.name) attrs.set(a.name, a); }
+        const first = (keys) => {
+            for (const k of keys) {
+                const v = attrs.get(k)?.value;
+                if (v == null) continue;
+                if (Array.isArray(v) && v.length > 0) return toNum(v[0]);
+                if (typeof v === 'number' || typeof v === 'bigint') return toNum(v);
+            }
+            return null;
+        };
+        const arr = (keys) => {
+            for (const k of keys) {
+                const v = attrs.get(k)?.value;
+                if (v == null) continue;
+                if (Array.isArray(v)) return v.map(toNum);
+                if (typeof v === 'number') return [toNum(v)];
+            }
+            return null;
+        };
+        const ks = arr(['kernel_size', 'kernel_sizes']);
+        const st = arr(['strides', 'stride']);
+
+        let ks0   = ks ? ks[0] : null;
+        let ks1   = ks ? (ks[1] ?? ks[0]) : null;
+        let outCh = first(['filters', 'units', 'num_filters', 'out_channels']);
+
+        // Fallback: kernel weight tensor (inputs[1]): [kH, kW, in_ch, out_ch]
+        const dims = this._weightDims(node, 1);
+        if (dims && dims.length >= 4) {
+            if (ks0   === null) ks0   = toNum(dims[0]);
+            if (ks1   === null) ks1   = toNum(dims[1]);
+            if (outCh === null) outCh = toNum(dims[3]);
+        }
+
+        return {
+            ks0,
+            ks1,
+            stride: st ? st[0] : null,
+            outCh,
+            groups: first(['groups', 'group']),
+            attrCount: attrs.size,
+        };
+    }
+
+    // Default fallback for all other formats.
+    // Tries common attribute names first, then weight tensor (inputs[1]) as fallback.
+    // Assumes the most common Conv weight layout [out_ch, in_ch, kH, kW] (ONNX-style).
+    static _extractAttrFeaturesDefault(node) {
+        const toNum = (v) => (typeof v === 'bigint') ? Number(v) : (typeof v === 'number' ? v : (Number(v) || 0));
+        const attrs = diffAnalyser.ModelNodesDiffAnalyzer._getNodeAttributes(node);
+        const first = (keys) => {
+            for (const k of keys) {
+                const v = attrs.get(k)?.value;
+                if (v == null) continue;
+                if (Array.isArray(v) && v.length > 0) return toNum(v[0]);
+                if (v !== null && v !== undefined) return toNum(v);
+            }
+            return null;
+        };
+
+        let ks0   = first(['kernel_shape', 'kernel_size', 'filter_height']);
+        let ks1   = first(['kernel_shape', 'kernel_size', 'filter_width']);
+        let outCh = first(['out_channels', 'num_output', 'num_filters', 'filters', 'units']);
+
+        // Fallback to weight tensor shape (inputs[1]), assuming [out_ch, in_ch, kH, kW]
+        const dims = this._weightDims(node, 1);
+        if (dims && dims.length >= 4) {
+            if (ks0   === null) ks0   = toNum(dims[2]);
+            if (ks1   === null) ks1   = toNum(dims[3]);
+            if (outCh === null) outCh = toNum(dims[0]);
+        }
+
+        return {
+            ks0,
+            ks1,
+            stride: first(['strides', 'stride', 'stride_w', 'stride_h']),
+            outCh,
+            groups: first(['group', 'groups']),
+            attrCount: attrs.size,
+        };
+    }
+
+    static _extractAttrFeatures(node) {
+        if (node instanceof onnx.Node)    return this._extractAttrFeaturesOnnx(node);
+        if (node instanceof pytorch.Node) return this._extractAttrFeaturesPytorch(node);
+        if (node instanceof tflite.Node)  return this._extractAttrFeaturesTflite(node);
+        if (node instanceof tf.Node)      return this._extractAttrFeaturesTf(node);
+        if (node instanceof keras.Node)   return this._extractAttrFeaturesKeras(node);
+        return this._extractAttrFeaturesDefault(node);
     }
 
     static _buildFeatureVectors(nodes, topo, vocab) {
@@ -831,36 +1091,106 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
     }
 
     // ----------------------------- Greedy Strong-First Matching -----------------------------
+    //
+    // Divide-and-conquer on subgraph pools:
+    //   matchSubgraphs(pool1, pool2):
+    //     1. Find the best pair (seed) in pool1 × pool2 — assign it
+    //     2. Partition each pool around the seed:
+    //          ancestors of seed  → recurse matchSubgraphs(anc1,  anc2)
+    //          descendants of seed → recurse matchSubgraphs(desc1, desc2)
+    //          remainder (disconnected from seed within the pool) → recurse matchSubgraphs(rem1, rem2)
+    //     3. Base case: no pair above threshold found → return
 
-    static _greedyMatch(nodes1, nodes2, sim, threshold) {
-        const n1 = nodes1.length;
+    static _greedyMatch(nodes1, nodes2, sim, threshold, topo1, topo2) {
         const n2 = nodes2.length;
 
-        // Collect candidates above threshold
-        const candidates = [];
-        for (let i = 0; i < n1; i++) {
-            for (let j = 0; j < n2; j++) {
-                const s = sim[i * n2 + j];
-                if (s > threshold) candidates.push(i * n2 + j);  // pack i,j,s
-            }
-        }
-        // Sort descending by score
-        candidates.sort((a, b) => sim[b] - sim[a]);
+        const idx1Map = new Map(nodes1.map((n, i) => [n, i]));
+        const idx2Map = new Map(nodes2.map((n, i) => [n, i]));
 
         const matched1    = new Set();
         const matched2    = new Set();
         const assignments = [];
 
-        // TODO: GW scoring boost could be inserted here for pairs with low sim score
+        // Transitive ancestors of nodes[nodeIdx], restricted to the given pool
+        const ancestorPool = (nodeIdx, nodes, topo, idxMap, pool) => {
+            const result = new Set();
+            const stack  = [...(topo.parentMap.get(nodes[nodeIdx]) ?? [])];
+            while (stack.length > 0) {
+                const node = stack.pop();
+                const ni   = idxMap.get(node);
+                if (ni === undefined || result.has(ni)) continue;
+                result.add(ni);
+                for (const p of (topo.parentMap.get(node) ?? [])) stack.push(p);
+            }
+            // Intersect with the current pool so we never escape our subgraph boundary
+            for (const ni of result) { if (!pool.has(ni)) result.delete(ni); }
+            return result;
+        };
 
-        for (const packed of candidates) {
-            const i = Math.floor(packed / n2);
-            const j = packed % n2;
-            if (matched1.has(i) || matched2.has(j)) continue;
-            assignments.push({ idx1: i, idx2: j, score: sim[packed] });
+        // Transitive descendants of nodes[nodeIdx], restricted to the given pool
+        const descendantPool = (nodeIdx, nodes, topo, idxMap, pool) => {
+            const result = new Set();
+            const stack  = [...(topo.childMap.get(nodes[nodeIdx]) ?? [])];
+            while (stack.length > 0) {
+                const node = stack.pop();
+                const ni   = idxMap.get(node);
+                if (ni === undefined || result.has(ni)) continue;
+                result.add(ni);
+                for (const c of (topo.childMap.get(node) ?? [])) stack.push(c);
+            }
+            for (const ni of result) { if (!pool.has(ni)) result.delete(ni); }
+            return result;
+        };
+
+        // Best unmatched pair in pool1 × pool2 above threshold; null if none found
+        const bestInPools = (pool1, pool2) => {
+            let bestI = -1, bestJ = -1, bestScore = threshold;
+            for (const ni of pool1) {
+                if (matched1.has(ni)) continue;
+                for (const nj of pool2) {
+                    if (matched2.has(nj)) continue;
+                    const s = sim[ni * n2 + nj];
+                    if (s > bestScore) { bestScore = s; bestI = ni; bestJ = nj; }
+                }
+            }
+            return bestI !== -1 ? { i: bestI, j: bestJ } : null;
+        };
+
+        const assign = (i, j) => {
             matched1.add(i);
             matched2.add(j);
-        }
+            assignments.push({ idx1: i, idx2: j, score: sim[i * n2 + j] });
+        };
+
+        // TODO: GW scoring boost could be inserted here for pairs with low sim score
+
+        const matchSubgraphs = (pool1, pool2) => {
+            // Base case: find best seed in this subgraph
+            const seed = bestInPools(pool1, pool2);
+            if (!seed) return;
+            assign(seed.i, seed.j);
+
+            // Ancestor subgraphs — nodes that feed into the seed
+            const anc1 = ancestorPool(seed.i, nodes1, topo1, idx1Map, pool1);
+            const anc2 = ancestorPool(seed.j, nodes2, topo2, idx2Map, pool2);
+            if (anc1.size > 0 && anc2.size > 0) matchSubgraphs(anc1, anc2);
+
+            // Descendant subgraphs — nodes that the seed feeds into
+            const desc1 = descendantPool(seed.i, nodes1, topo1, idx1Map, pool1);
+            const desc2 = descendantPool(seed.j, nodes2, topo2, idx2Map, pool2);
+            if (desc1.size > 0 && desc2.size > 0) matchSubgraphs(desc1, desc2);
+
+            // Remainder — nodes disconnected from the seed within this pool
+            // (handles parallel branches and isolated subgraphs)
+            const rem1 = new Set([...pool1].filter(x => x !== seed.i && !anc1.has(x) && !desc1.has(x)));
+            const rem2 = new Set([...pool2].filter(x => x !== seed.j && !anc2.has(x) && !desc2.has(x)));
+            if (rem1.size > 0 && rem2.size > 0) matchSubgraphs(rem1, rem2);
+        };
+
+        matchSubgraphs(
+            new Set(nodes1.map((_, i) => i)),
+            new Set(nodes2.map((_, i) => i))
+        );
 
         return { assignments, matched1, matched2 };
     }
@@ -968,8 +1298,8 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
         // 5. Cosine similarity with type-compatibility mask
         const sim = this._buildSimilarityMatrix(nodes1, nodes2, fmap1, fmap2, compatGroups, vocab);
 
-        // 6. Greedy strong-first matching
-        const { assignments, matched1, matched2 } = this._greedyMatch(nodes1, nodes2, sim, this.SOFT_MATCH_THRESHOLD);
+        // 6. Greedy strong-first matching (neighbor-constrained)
+        const { assignments, matched1, matched2 } = this._greedyMatch(nodes1, nodes2, sim, this.SOFT_MATCH_THRESHOLD, topo1, topo2);
 
         // 7. Local graph expansion for unmatched nodes
         this._expandMatches(assignments, matched1, matched2, nodes1, nodes2, topo1, topo2, sim, nodes2.length);
