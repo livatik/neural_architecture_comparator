@@ -610,11 +610,17 @@ diffAnalyser.ModelNodesDiffAnalyzer = class {
 diffAnalyser.SoftModelNodesDiffAnalyzer = class {
 
     // ----------------------------- Constants -----------------------------
-    static FEATURE_DIM = 16;
+    static FEATURE_DIM = 19;
     static MESSAGE_PASS_ROUNDS = 4;
     static SOFT_MATCH_THRESHOLD = 0.35;
     static EXPANSION_THRESHOLD = 0.25;
-    static SELF_WEIGHT = 0.5;
+    static SELF_WEIGHT = 0.6;
+    // Upper bound for type-ordinal normalization (vec[18]).
+    // Conv#0 → 0/MAX, Conv#1 → 1/MAX, … same index = same value across both models.
+    static MAX_TYPE_COUNT = 100;
+    // Multiplier for vec[0] (node typeIdx). Values > 1 increase its weight
+    // in cosine similarity relative to all other structural features.
+    static TYPE_IDX_SCALE = 3.0;
 
     // ----------------------------- Type Vocabulary -----------------------------
 
@@ -631,16 +637,22 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
 
     static _buildCompatibilityGroups(vocab) {
         const groups = new Int32Array(vocab.size);
+
         const rules = [
-            [/^conv/i,           0],
-            [/^batchnorm|^bn$/i, 1],
-            [/^relu|^activation|^sigmoid|^tanh|^elu|^leaky/i, 2],
-            [/^pool/i,           3],
-            [/^linear|^dense|^gemm|^matmul|^fc$/i, 4],
-            [/^add$|^mul$|^concat|^merge|^elementwise/i, 5],
+            [/conv/i,                              0],  // conv2d, convolution, conv_transpose, depthwise_conv
+            [/batchnorm|batch_norm|^bn$/i,         1],  // BatchNorm2d, batch_normalization, FusedBatchNorm
+            [/relu|activation|sigmoid|tanh|^elu|leaky|hardswish|gelu|silu|mish/i, 2],
+            [/pool/i,                              3],  // MaxPool, AvgPool, GlobalAveragePool
+            [/linear|dense|gemm|matmul|^fc$|fully_connected|inner_product/i, 4],
+            [/^add$|^mul$|^div$|concat|merge|elementwise|add_n|multiply/i,   5],
+            [/dropout/i,                                                     6],  // Dropout, AlphaDropout, DropPath
         ];
+
+        // Known groups occupy 0–6. Unmatched types each get a unique group
+        // (100 + typeIdx) so they are never compatible with each other.
+        const UNKNOWN_BASE = 100;
         for (const [typeName, idx] of vocab.typeToIdx) {
-            let group = 99;
+            let group = UNKNOWN_BASE + idx;
             for (const [re, g] of rules) {
                 if (re.test(typeName)) { group = g; break; }
             }
@@ -981,13 +993,41 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
         const maxRank = Math.max(1, ...[...topo.topoRank.values()]);
         const fmap = new Map();
 
+        const MNA = diffAnalyser.ModelNodesDiffAnalyzer;
+
+        // Absolute ordinal index among nodes of the same type, sorted by topoRank.
+        // Normalized by MAX_TYPE_COUNT (fixed constant, not per-model count) so that
+        // Conv#2 in model1 and Conv#2 in model2 produce identical vec[18] values.
+        const typeRelRank = new Map();
+        const byType = new Map();
+        for (const node of nodes) {
+            const tn = MNA._getNodeTypeName(node) ?? '__unknown__';
+            if (!byType.has(tn)) byType.set(tn, []);
+            byType.get(tn).push(node);
+        }
+        for (const group of byType.values()) {
+            group.sort((a, b) => (topo.topoRank.get(a) ?? 0) - (topo.topoRank.get(b) ?? 0));
+            group.forEach((node, i) => typeRelRank.set(node, i / this.MAX_TYPE_COUNT));
+        }
+
+        const meanTypeIdx = (neighbors) => {
+            let sum = 0, cnt = 0;
+            for (const nbr of neighbors) {
+                if (!nbr || nbr.type == null) continue;
+                const tn = MNA._getNodeTypeName(nbr) ?? '__unknown__';
+                sum += vocab.typeToIdx.get(tn) ?? 0;
+                cnt++;
+            }
+            return cnt > 0 ? sum / cnt : 0;
+        };
+
         for (const node of nodes) {
             const vec = new Float32Array(DIM);
-            const typeName = diffAnalyser.ModelNodesDiffAnalyzer._getNodeTypeName(node) ?? '__unknown__';
+            const typeName = MNA._getNodeTypeName(node) ?? '__unknown__';
             const typeIdx  = vocab.typeToIdx.get(typeName) ?? 0;
             const { ks0, ks1, stride, outCh, groups, attrCount } = this._extractAttrFeatures(node);
 
-            vec[0]  = typeIdx / vocab.size;
+            vec[0]  = typeIdx / vocab.size * this.TYPE_IDX_SCALE;
             vec[1]  = (topo.inDegree.get(node)  ?? 0) / maxDeg;
             vec[2]  = (topo.outDegree.get(node) ?? 0) / maxDeg;
             vec[3]  = (topo.topoRank.get(node)  ?? 0) / maxRank;
@@ -1003,6 +1043,9 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
             vec[13] = Math.min(attrCount, 20) / 20;
             vec[14] = Math.min((node.inputs  ?? []).length, 8) / 8;
             vec[15] = Math.min((node.outputs ?? []).length, 8) / 8;
+            vec[16] = meanTypeIdx(topo.parentMap.get(node) ?? []) / vocab.size;
+            vec[17] = meanTypeIdx(topo.childMap.get(node)  ?? []) / vocab.size;
+            vec[18] = typeRelRank.get(node) ?? 0;
 
             fmap.set(node, vec);
         }
@@ -1011,29 +1054,52 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
 
     // ----------------------------- Message Passing -----------------------------
 
+    // Weights for directed message passing: self + upstream (parents) + downstream (children).
+    // W_PAR != W_CHI encodes edge direction — relu→conv→bn differs from conv→bn→relu.
+    static W_PAR   = 0.3; // 0.3 — upstream context
+    static W_CHI   = 0.2; // 0.2 — downstream context
+
     static _messagePass(nodes, fmap, topo, rounds) {
-        const DIM  = this.FEATURE_DIM;
-        const SELF = this.SELF_WEIGHT;
-        const AGG  = 1 - SELF;
+        const DIM   = this.FEATURE_DIM;
+        const WSELF = this.SELF_WEIGHT;
+        const WPAR  = this.W_PAR;
+        const WCHI  = this.W_CHI;
+
+        const meanVec = (neighbors) => {
+            const acc = new Float32Array(DIM);
+            let cnt = 0;
+            for (const nbr of neighbors) {
+                const nv = fmap.get(nbr);
+                if (!nv) continue;
+                for (let i = 0; i < DIM; i++) acc[i] += nv[i];
+                cnt++;
+            }
+            if (cnt > 1) for (let i = 0; i < DIM; i++) acc[i] /= cnt;
+            return { vec: acc, any: cnt > 0 };
+        };
 
         for (let r = 0; r < rounds; r++) {
             const newMap = new Map();
             for (const node of nodes) {
                 const selfVec = fmap.get(node);
-                const nbrs    = [...(topo.parentMap.get(node) ?? []), ...(topo.childMap.get(node) ?? [])];
-                const aggVec  = new Float32Array(DIM);
-                let   cnt     = 0;
-                for (const nbr of nbrs) {
-                    const nv = fmap.get(nbr);
-                    if (!nv) continue;
-                    for (let i = 0; i < DIM; i++) aggVec[i] += nv[i];
-                    cnt++;
-                }
+                const { vec: parVec,  any: hasPar  } = meanVec(topo.parentMap.get(node) ?? []);
+                const { vec: chiVec,  any: hasChi  } = meanVec(topo.childMap.get(node)  ?? []);
+
                 const newVec = new Float32Array(DIM);
-                if (cnt > 0) {
-                    for (let i = 0; i < DIM; i++) newVec[i] = SELF * selfVec[i] + AGG * (aggVec[i] / cnt);
-                } else {
-                    for (let i = 0; i < DIM; i++) newVec[i] = selfVec[i];
+                for (let i = 0; i < DIM; i++) {
+                    newVec[i] = WSELF * selfVec[i]
+                              + (hasPar ? WPAR * parVec[i] : 0)
+                              + (hasChi ? WCHI * chiVec[i] : 0);
+                    // Renormalize when a direction is absent so weights still sum to 1
+                    if (!hasPar && !hasChi) {
+                        newVec[i] = selfVec[i];
+                    } else if (!hasPar) {
+                        newVec[i] = WSELF / (WSELF + WCHI) * selfVec[i]
+                                  + WCHI  / (WSELF + WCHI) * chiVec[i];
+                    } else if (!hasChi) {
+                        newVec[i] = WSELF / (WSELF + WPAR) * selfVec[i]
+                                  + WPAR  / (WSELF + WPAR) * parVec[i];
+                    }
                 }
                 newMap.set(node, newVec);
             }
@@ -1200,12 +1266,24 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
     static _expandMatches(assignments, matched1, matched2, nodes1, nodes2, topo1, topo2, sim, n2) {
         const THRESH = this.EXPANSION_THRESHOLD;
 
-        // Precompute node→index maps
-        const idx1Map = new Map(nodes1.map((n, i) => [n, i]));
-        const idx2Map = new Map(nodes2.map((n, i) => [n, i]));
-
-        // Build idx1→idx2 map from current assignments for neighbour lookups
+        const idx1Map   = new Map(nodes1.map((n, i) => [n, i]));
+        const idx2Map   = new Map(nodes2.map((n, i) => [n, i]));
         const assignMap = new Map(assignments.map(a => [a.idx1, a.idx2]));
+
+        const bestCand = (i, anchors1, getCands2) => {
+            let bestScore = THRESH, bestJ = -1;
+            for (const nbr1 of anchors1) {
+                const nbrIdx1 = idx1Map.get(nbr1);
+                if (nbrIdx1 === undefined || !assignMap.has(nbrIdx1)) continue;
+                for (const cand2 of getCands2(nodes2[assignMap.get(nbrIdx1)])) {
+                    const j = idx2Map.get(cand2);
+                    if (j === undefined || matched2.has(j)) continue;
+                    const s = sim[i * n2 + j];
+                    if (s > bestScore) { bestScore = s; bestJ = j; }
+                }
+            }
+            return bestJ;
+        };
 
         let changed = true;
         while (changed) {
@@ -1213,28 +1291,23 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
             for (let i = 0; i < nodes1.length; i++) {
                 if (matched1.has(i)) continue;
                 const node1 = nodes1[i];
-                const nbrs1 = [...(topo1.parentMap.get(node1) ?? []), ...(topo1.childMap.get(node1) ?? [])];
 
-                let bestScore = THRESH;
-                let bestJ     = -1;
+                // node1 comes AFTER its parents → its match must come after the matched parent
+                let bestJ = bestCand(i,
+                    topo1.parentMap.get(node1) ?? [],
+                    n2nbr => topo2.childMap.get(n2nbr) ?? []
+                );
 
-                for (const nbr1 of nbrs1) {
-                    const nbrIdx1 = idx1Map.get(nbr1);
-                    if (nbrIdx1 === undefined || !assignMap.has(nbrIdx1)) continue;
-                    const matchedIdx2 = assignMap.get(nbrIdx1);
-                    const node2nbr    = nodes2[matchedIdx2];
-
-                    const cands2 = [...(topo2.parentMap.get(node2nbr) ?? []), ...(topo2.childMap.get(node2nbr) ?? [])];
-                    for (const cand2 of cands2) {
-                        const j = idx2Map.get(cand2);
-                        if (j === undefined || matched2.has(j)) continue;
-                        const s = sim[i * n2 + j];
-                        if (s > bestScore) { bestScore = s; bestJ = j; }
-                    }
+                // node1 comes BEFORE its children → its match must come before the matched child
+                if (bestJ === -1) {
+                    bestJ = bestCand(i,
+                        topo1.childMap.get(node1) ?? [],
+                        n2nbr => topo2.parentMap.get(n2nbr) ?? []
+                    );
                 }
 
                 if (bestJ !== -1) {
-                    assignments.push({ idx1: i, idx2: bestJ, score: bestScore });
+                    assignments.push({ idx1: i, idx2: bestJ, score: sim[i * n2 + bestJ] });
                     matched1.add(i);
                     matched2.add(bestJ);
                     assignMap.set(i, bestJ);
