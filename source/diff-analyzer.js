@@ -636,29 +636,46 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
     }
 
     static _buildCompatibilityGroups(vocab) {
-        const groups = new Int32Array(vocab.size);
-
         const rules = [
             [/conv/i,                              0],  // conv2d, convolution, conv_transpose, depthwise_conv
             [/batchnorm|batch_norm|^bn$/i,         1],  // BatchNorm2d, batch_normalization, FusedBatchNorm
             [/relu|activation|sigmoid|tanh|^elu|leaky|hardswish|gelu|silu|mish/i, 2],
             [/pool/i,                              3],  // MaxPool, AvgPool, GlobalAveragePool
             [/linear|dense|gemm|matmul|^fc$|fully_connected|inner_product/i, 4],
-            [/^add$|^mul$|^div$|concat|merge|elementwise|add_n|multiply/i,   5],
+            [/^add$|add$|^mul$|^div$|concat|merge|elementwise|add_n|multiply/i,   5],
             [/dropout/i,                                                     6],  // Dropout, AlphaDropout, DropPath
         ];
 
         // Known groups occupy 0–6. Unmatched types each get a unique group
         // (100 + typeIdx) so they are never compatible with each other.
         const UNKNOWN_BASE = 100;
-        for (const [typeName, idx] of vocab.typeToIdx) {
-            let group = UNKNOWN_BASE + idx;
+
+        // Assign a group to every type name
+        const typeGroups = [];
+        for (const [typeName, oldIdx] of vocab.typeToIdx) {
+            let group = UNKNOWN_BASE + oldIdx;
             for (const [re, g] of rules) {
                 if (re.test(typeName)) { group = g; break; }
             }
-            groups[idx] = group;
+            typeGroups.push({ typeName, group });
         }
-        return groups;
+
+        // Reorder: known groups first (0–6) then unknowns, stable within each group
+        typeGroups.sort((a, b) => a.group - b.group);
+
+        // Rebuild typeToIdx with contiguous indices in the new order
+        const typeToIdx = new Map();
+        for (const { typeName } of typeGroups) {
+            typeToIdx.set(typeName, typeToIdx.size);
+        }
+        const orderedVocab = { typeToIdx, size: typeToIdx.size || 1 };
+
+        const groups = new Int32Array(orderedVocab.size);
+        for (const { typeName, group } of typeGroups) {
+            groups[typeToIdx.get(typeName)] = group;
+        }
+
+        return { vocab: orderedVocab, groups };
     }
 
     // ----------------------------- Graph Topology -----------------------------
@@ -1247,7 +1264,6 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
             if (desc1.size > 0 && desc2.size > 0) matchSubgraphs(desc1, desc2);
 
             // Remainder — nodes disconnected from the seed within this pool
-            // (handles parallel branches and isolated subgraphs)
             const rem1 = new Set([...pool1].filter(x => x !== seed.i && !anc1.has(x) && !desc1.has(x)));
             const rem2 = new Set([...pool2].filter(x => x !== seed.j && !anc2.has(x) && !desc2.has(x)));
             if (rem1.size > 0 && rem2.size > 0) matchSubgraphs(rem1, rem2);
@@ -1346,9 +1362,9 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
             return new diffAnalyser.ModelDifferences([]);
         }
 
-        // 1. Shared type vocabulary
-        const vocab        = this._buildVocabulary(nodes1, nodes2);
-        const compatGroups = this._buildCompatibilityGroups(vocab);
+        // 1. Shared type vocabulary (reordered by compatibility group)
+        const rawVocab                      = this._buildVocabulary(nodes1, nodes2);
+        const { vocab, groups: compatGroups } = this._buildCompatibilityGroups(rawVocab);
 
         // 2. Edge graphs (reuse existing infrastructure)
         const model1Inputs    = diffAnalyser.ModelNodesDiffAnalyzer._getInputs(model1);
