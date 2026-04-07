@@ -38,6 +38,10 @@ diffAnalyser.StartNode = class {
     }
 };
 
+// Virtual sink node — symmetric to StartNode.
+// Used as the downstream anchor boundary in two-pass sub-graph matching.
+diffAnalyser.EndNode = class {};
+
 export const DiffStatus = Object.freeze({
     SAME: 'SAME',
     DIFF: 'DIFF',
@@ -611,10 +615,10 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
 
     // ----------------------------- Constants -----------------------------
     static FEATURE_DIM = 19;
-    static MESSAGE_PASS_ROUNDS = 4;
+    static MESSAGE_PASS_ROUNDS = 2;
     static SOFT_MATCH_THRESHOLD = 0.35;
     static EXPANSION_THRESHOLD = 0.25;
-    static SELF_WEIGHT = 0.6;
+    static SELF_WEIGHT = 0.5;
     // Upper bound for type-ordinal normalization (vec[18]).
     // Conv#0 → 0/MAX, Conv#1 → 1/MAX, … same index = same value across both models.
     static MAX_TYPE_COUNT = 100;
@@ -764,10 +768,11 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
         return {
             ks0,
             ks1,
-            stride:    st ? st[0] : null,
+            stride:          st ? st[0] : null,
             outCh,
-            groups:    scalar('group'),
-            attrCount: attrs.size,
+            groups:          scalar('group'),
+            depthMultiplier: null,
+            attrCount:       attrs.size,
         };
     }
 
@@ -811,10 +816,11 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
         return {
             ks0,
             ks1,
-            stride: first(['stride', 'strides']),
+            stride:          first(['stride', 'strides']),
             outCh,
-            groups: first(['groups', 'group']),
-            attrCount: attrs.size,
+            groups:          first(['groups', 'group']),
+            depthMultiplier: first(['depth_multiplier']),
+            attrCount:       attrs.size,
         };
     }
 
@@ -841,28 +847,34 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
         // Pool ops expose kernel size directly as attributes
         let ks0 = scalar(['filter_height']);
         let ks1 = scalar(['filter_width']);
-        let outCh = scalar(['depth_multiplier']);
+        let depthMultiplier = scalar(['depth_multiplier']);
+        let outCh = null;
 
         // Conv ops: read kernel size and output channels from weight tensor shape (inputs[1])
-        if (ks0 === null || ks1 === null || outCh === null) {
-            const weightArg = (node.inputs ?? [])[1];
-            const dims = weightArg?.value?.[0]?.type?.shape?.dimensions;
-            if (Array.isArray(dims) && dims.length === 4) {
-                // [out_channels, kH, kW, in_channels] for Conv2D
-                // [1, kH, kW, depth_multiplier] for DepthwiseConv2D
-                if (ks0 === null) ks0 = toNum(dims[1]);
-                if (ks1 === null) ks1 = toNum(dims[2]);
-                if (outCh === null) outCh = toNum(dims[0]);
+        const weightArg = (node.inputs ?? [])[1];
+        const dims = weightArg?.value?.[0]?.type?.shape?.dimensions;
+        if (Array.isArray(dims) && dims.length === 4) {
+            // Conv2D layout:         [out_channels, kH, kW, in_channels]
+            // DepthwiseConv2D layout: [1, kH, kW, depth_multiplier]
+            if (ks0 === null) ks0 = toNum(dims[1]);
+            if (ks1 === null) ks1 = toNum(dims[2]);
+            const dim0 = toNum(dims[0]);
+            if (dim0 > 1) {
+                outCh = dim0;
+            } else {
+                // DepthwiseConv2D: dims[3] holds depth_multiplier
+                if (depthMultiplier === null) depthMultiplier = toNum(dims[3]);
             }
         }
 
         return {
             ks0,
             ks1,
-            stride: scalar(['stride_w', 'stride_h']),
+            stride:          scalar(['stride_w', 'stride_h']),
             outCh,
-            groups: null,
-            attrCount: attrs.size,
+            groups:          null,
+            depthMultiplier,
+            attrCount:       attrs.size,
         };
     }
 
@@ -900,10 +912,11 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
         return {
             ks0,
             ks1,
-            stride: nhwcIdx('strides', 1),
+            stride:          nhwcIdx('strides', 1),
             outCh,
-            groups: null,
-            attrCount: attrs.size,
+            groups:          null,
+            depthMultiplier: null,
+            attrCount:       attrs.size,
         };
     }
 
@@ -950,10 +963,11 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
         return {
             ks0,
             ks1,
-            stride: st ? st[0] : null,
+            stride:          st ? st[0] : null,
             outCh,
-            groups: first(['groups', 'group']),
-            attrCount: attrs.size,
+            groups:          first(['groups', 'group']),
+            depthMultiplier: first(['depth_multiplier']),
+            attrCount:       attrs.size,
         };
     }
 
@@ -988,10 +1002,11 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
         return {
             ks0,
             ks1,
-            stride: first(['strides', 'stride', 'stride_w', 'stride_h']),
+            stride:          first(['strides', 'stride', 'stride_w', 'stride_h']),
             outCh,
-            groups: first(['group', 'groups']),
-            attrCount: attrs.size,
+            groups:          first(['group', 'groups']),
+            depthMultiplier: first(['depth_multiplier']),
+            attrCount:       attrs.size,
         };
     }
 
@@ -1004,17 +1019,35 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
         return this._extractAttrFeaturesDefault(node);
     }
 
-    static _buildFeatureVectors(nodes, topo, vocab) {
-        const DIM    = this.FEATURE_DIM;
-        const maxDeg = Math.max(1, ...nodes.map(n => Math.max(topo.inDegree.get(n) ?? 0, topo.outDegree.get(n) ?? 0)));
+    // Extract spatial dimensions from inputs[0] (the primary activation tensor).
+    // For multi-input ops (Add, Concat, etc.) inputs[0] is used as-is — all inputs
+    // share H×W so this is accurate for Add/Mul; for Concat only the first branch is read.
+    // Layout: ONNX/PyTorch = NCHW, TFLite/TF/Keras = NHWC.
+    static _extractInputShape(node) {
+        const toNum = (v) => (typeof v === 'bigint') ? Number(v) : (typeof v === 'number' ? v : (Number(v) || 0));
+        const arg  = (node.inputs ?? [])[0];
+        const dims = arg?.value?.[0]?.type?.shape?.dimensions;
+        if (!Array.isArray(dims) || dims.length < 2) return { width: 0, height: 0, channels: 0 };
+        if (dims.length === 2) return { width: 0, height: 0, channels: toNum(dims[1]) };
+        if (dims.length >= 4) {
+            const isNHWC = node instanceof tflite.Node || node instanceof tf.Node || node instanceof keras.Node;
+            if (isNHWC) return { height: toNum(dims[1]), width: toNum(dims[2]), channels: toNum(dims[3]) };
+            return { channels: toNum(dims[1]), height: toNum(dims[2]), width: toNum(dims[3]) }; // NCHW
+        }
+        return { width: 0, height: toNum(dims[1]), channels: toNum(dims[2]) }; // 3D: [batch, length, features]
+    }
+
+    static _buildFeatureVectors(nodes, topo, vocab, compatGroups) {
+        const DIM     = this.FEATURE_DIM;
+        const maxDeg  = Math.max(1, ...nodes.map(n => Math.max(topo.inDegree.get(n) ?? 0, topo.outDegree.get(n) ?? 0)));
         const maxRank = Math.max(1, ...[...topo.topoRank.values()]);
-        const fmap = new Map();
+        const fmap    = new Map();
 
-        const MNA = diffAnalyser.ModelNodesDiffAnalyzer;
+        const MNA        = diffAnalyser.ModelNodesDiffAnalyzer;
+        const NUM_GROUPS = 7;  // named groups 0–6; slot 7 = unknown bucket
+        const LOG_SCALE  = 12; // log2(1 + 4096) ≈ 12 — covers spatial dims up to 4096
 
-        // Absolute ordinal index among nodes of the same type, sorted by topoRank.
-        // Normalized by MAX_TYPE_COUNT (fixed constant, not per-model count) so that
-        // Conv#2 in model1 and Conv#2 in model2 produce identical vec[18] values.
+        // Ordinal rank within same type, sorted by topoRank, normalised by MAX_TYPE_COUNT.
         const typeRelRank = new Map();
         const byType = new Map();
         for (const node of nodes) {
@@ -1027,42 +1060,38 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
             group.forEach((node, i) => typeRelRank.set(node, i / this.MAX_TYPE_COUNT));
         }
 
-        const meanTypeIdx = (neighbors) => {
-            let sum = 0, cnt = 0;
+        // Multi-hot: set a bit for each compatibility group present among the given neighbours.
+        // Slot NUM_GROUPS (7) collects all unknown groups.
+        const neighborGroupBits = (neighbors, out, offset) => {
             for (const nbr of neighbors) {
                 if (!nbr || nbr.type == null) continue;
-                const tn = MNA._getNodeTypeName(nbr) ?? '__unknown__';
-                sum += vocab.typeToIdx.get(tn) ?? 0;
-                cnt++;
+                const tn    = MNA._getNodeTypeName(nbr) ?? '__unknown__';
+                const idx   = vocab.typeToIdx.get(tn) ?? 0;
+                const grp   = compatGroups[idx];
+                const slot  = grp < NUM_GROUPS ? grp : NUM_GROUPS;
+                out[offset + slot] = 1;
             }
-            return cnt > 0 ? sum / cnt : 0;
         };
 
         for (const node of nodes) {
             const vec = new Float32Array(DIM);
-            const typeName = MNA._getNodeTypeName(node) ?? '__unknown__';
-            const typeIdx  = vocab.typeToIdx.get(typeName) ?? 0;
-            const { ks0, ks1, stride, outCh, groups, attrCount } = this._extractAttrFeatures(node);
 
-            vec[0]  = typeIdx / vocab.size * this.TYPE_IDX_SCALE;
-            vec[1]  = (topo.inDegree.get(node)  ?? 0) / maxDeg;
-            vec[2]  = (topo.outDegree.get(node) ?? 0) / maxDeg;
-            vec[3]  = (topo.topoRank.get(node)  ?? 0) / maxRank;
-            vec[4]  = ks0 !== null ? 1 : 0;
-            vec[5]  = ks0 !== null ? Math.min(ks0, 32) / 32 : 0;
-            vec[6]  = ks1 !== null ? Math.min(ks1, 32) / 32 : 0;
-            vec[7]  = stride !== null ? 1 : 0;
-            vec[8]  = stride !== null ? Math.min(stride, 8) / 8 : 0;
-            vec[9]  = outCh !== null ? 1 : 0;
-            vec[10] = outCh !== null ? Math.min(outCh, 4096) / 4096 : 0;
-            vec[11] = groups !== null ? 1 : 0;
-            vec[12] = groups !== null ? Math.min(groups, 256) / 256 : 0;
-            vec[13] = Math.min(attrCount, 20) / 20;
-            vec[14] = Math.min((node.inputs  ?? []).length, 8) / 8;
-            vec[15] = Math.min((node.outputs ?? []).length, 8) / 8;
-            vec[16] = meanTypeIdx(topo.parentMap.get(node) ?? []) / vocab.size;
-            vec[17] = meanTypeIdx(topo.childMap.get(node)  ?? []) / vocab.size;
-            vec[18] = typeRelRank.get(node) ?? 0;
+            const { width, height, channels } = this._extractInputShape(node);
+            const { ks0, stride, outCh, depthMultiplier } = this._extractAttrFeatures(node);
+
+            vec[0] = (topo.inDegree.get(node)  ?? 0) / maxDeg;
+            vec[1] = (topo.outDegree.get(node) ?? 0) / maxDeg;
+            vec[2] = (topo.topoRank.get(node)  ?? 0) / maxRank;
+            vec[3] = typeRelRank.get(node) ?? 0;
+            vec[4] = Math.log2(1 + width)    / LOG_SCALE;
+            vec[5] = Math.log2(1 + height)   / LOG_SCALE;
+            vec[6] = Math.log2(1 + channels) / LOG_SCALE;
+            // vec[7..14]  — multi-hot parent (input) groups
+            neighborGroupBits(topo.parentMap.get(node) ?? [], vec, 7);
+            vec[15] = ks0             !== null ? Math.min(ks0,             32)   / 32   : 0;
+            vec[16] = stride          !== null ? Math.min(stride,          8)    / 8    : 0;
+            vec[17] = depthMultiplier !== null ? Math.min(depthMultiplier, 32)   / 32   : 0;
+            vec[18] = outCh           !== null ? Math.min(outCh,           4096) / 4096 : 0;
 
             fmap.set(node, vec);
         }
@@ -1073,8 +1102,8 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
 
     // Weights for directed message passing: self + upstream (parents) + downstream (children).
     // W_PAR != W_CHI encodes edge direction — relu→conv→bn differs from conv→bn→relu.
-    static W_PAR   = 0.3; // 0.3 — upstream context
-    static W_CHI   = 0.2; // 0.2 — downstream context
+    static W_PAR   = 0.2; // upstream context
+    static W_CHI   = 0.1; // downstream context
 
     static _messagePass(nodes, fmap, topo, rounds) {
         const DIM   = this.FEATURE_DIM;
@@ -1133,19 +1162,25 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
         return Math.sqrt(s);
     }
 
-    static _buildSimilarityMatrix(nodes1, nodes2, fmap1, fmap2, compatGroups, vocab) {
+    static _buildSimilarityMatrix(nodes1, nodes2, fmap1, fmap2, compatGroups, vocab, topo1 = null, topo2 = null, strictDegree = false) {
         const n1  = nodes1.length;
         const n2  = nodes2.length;
         const DIM = this.FEATURE_DIM;
         const sim = new Float32Array(n1 * n2);
 
-        // Precompute norms and group for nodes2
+        // Precompute norms, group, and degree for nodes2
         const norms2  = new Float32Array(n2);
         const groups2 = new Int32Array(n2);
+        const inDeg2  = strictDegree ? new Int32Array(n2) : null;
+        const outDeg2 = strictDegree ? new Int32Array(n2) : null;
         for (let j = 0; j < n2; j++) {
             norms2[j]  = this._l2norm(fmap2.get(nodes2[j]));
             const tn   = diffAnalyser.ModelNodesDiffAnalyzer._getNodeTypeName(nodes2[j]) ?? '__unknown__';
             groups2[j] = compatGroups[vocab.typeToIdx.get(tn) ?? 0] ?? 99;
+            if (strictDegree && topo2) {
+                inDeg2[j]  = topo2.inDegree.get(nodes2[j])  ?? 0;
+                outDeg2[j] = topo2.outDegree.get(nodes2[j]) ?? 0;
+            }
         }
 
         for (let i = 0; i < n1; i++) {
@@ -1153,10 +1188,15 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
             const norm1  = this._l2norm(vec1);
             const tn1    = diffAnalyser.ModelNodesDiffAnalyzer._getNodeTypeName(nodes1[i]) ?? '__unknown__';
             const group1 = compatGroups[vocab.typeToIdx.get(tn1) ?? 0] ?? 99;
+            const inD1   = strictDegree && topo1 ? (topo1.inDegree.get(nodes1[i])  ?? 0) : 0;
+            const outD1  = strictDegree && topo1 ? (topo1.outDegree.get(nodes1[i]) ?? 0) : 0;
 
             for (let j = 0; j < n2; j++) {
                 if (group1 !== groups2[j]) {
-                    // type-incompatible: hard zero
+                    sim[i * n2 + j] = 0;
+                    continue;
+                }
+                if (strictDegree && (inD1 !== inDeg2[j] || outD1 !== outDeg2[j])) {
                     sim[i * n2 + j] = 0;
                     continue;
                 }
@@ -1194,46 +1234,64 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
         const matched2    = new Set();
         const assignments = [];
 
-        // Transitive ancestors of nodes[nodeIdx], restricted to the given pool
+        // Transitive ancestors of nodes[nodeIdx], restricted to the given pool.
+        // Nodes NOT in idxMap (intermediaries outside the pool) are traversed through
+        // so that pool members reachable via such pass-through nodes are still found.
         const ancestorPool = (nodeIdx, nodes, topo, idxMap, pool) => {
-            const result = new Set();
-            const stack  = [...(topo.parentMap.get(nodes[nodeIdx]) ?? [])];
+            const result  = new Set();
+            const visited = new Set();
+            const stack   = [...(topo.parentMap.get(nodes[nodeIdx]) ?? [])];
             while (stack.length > 0) {
                 const node = stack.pop();
-                const ni   = idxMap.get(node);
-                if (ni === undefined || result.has(ni)) continue;
-                result.add(ni);
+                if (visited.has(node)) continue;
+                visited.add(node);
+                const ni = idxMap.get(node);
+                if (ni !== undefined && pool.has(ni)) result.add(ni);
+                // Always traverse further — intermediaries outside the pool are pass-through
                 for (const p of (topo.parentMap.get(node) ?? [])) stack.push(p);
             }
-            // Intersect with the current pool so we never escape our subgraph boundary
-            for (const ni of result) { if (!pool.has(ni)) result.delete(ni); }
             return result;
         };
 
-        // Transitive descendants of nodes[nodeIdx], restricted to the given pool
+        // Transitive descendants of nodes[nodeIdx], restricted to the given pool.
+        // Same pass-through logic as ancestorPool.
         const descendantPool = (nodeIdx, nodes, topo, idxMap, pool) => {
-            const result = new Set();
-            const stack  = [...(topo.childMap.get(nodes[nodeIdx]) ?? [])];
+            const result  = new Set();
+            const visited = new Set();
+            const stack   = [...(topo.childMap.get(nodes[nodeIdx]) ?? [])];
             while (stack.length > 0) {
                 const node = stack.pop();
-                const ni   = idxMap.get(node);
-                if (ni === undefined || result.has(ni)) continue;
-                result.add(ni);
+                if (visited.has(node)) continue;
+                visited.add(node);
+                const ni = idxMap.get(node);
+                if (ni !== undefined && pool.has(ni)) result.add(ni);
+                // Always traverse further — intermediaries outside the pool are pass-through
                 for (const c of (topo.childMap.get(node) ?? [])) stack.push(c);
             }
-            for (const ni of result) { if (!pool.has(ni)) result.delete(ni); }
             return result;
         };
 
-        // Best unmatched pair in pool1 × pool2 above threshold; null if none found
+        // Best unmatched pair in pool1 × pool2 above threshold; null if none found.
+        // Priority boosts pairs where both nodes share the same inDegree AND outDegree:
+        // structurally identical high-connectivity nodes (Add, Concat, multi-output splits)
+        // become preferred seeds over lower-connectivity nodes with equal similarity.
+        const degOf = (ni, nodes, topo) => {
+            const n = nodes[ni];
+            return { in: topo.inDegree.get(n) ?? 0, out: topo.outDegree.get(n) ?? 0 };
+        };
         const bestInPools = (pool1, pool2) => {
-            let bestI = -1, bestJ = -1, bestScore = threshold;
+            let bestI = -1, bestJ = -1, bestPriority = -Infinity;
             for (const ni of pool1) {
                 if (matched1.has(ni)) continue;
+                const d1 = degOf(ni, nodes1, topo1);
                 for (const nj of pool2) {
                     if (matched2.has(nj)) continue;
                     const s = sim[ni * n2 + nj];
-                    if (s > bestScore) { bestScore = s; bestI = ni; bestJ = nj; }
+                    if (s <= threshold) continue;
+                    const d2       = degOf(nj, nodes2, topo2);
+                    const sameConn = d1.in === d2.in && d1.out === d2.out;
+                    const priority = sameConn ? s * Math.log2(2 + d1.in + d1.out) : s;
+                    if (priority > bestPriority) { bestPriority = priority; bestI = ni; bestJ = nj; }
                 }
             }
             return bestI !== -1 ? { i: bestI, j: bestJ } : null;
@@ -1257,13 +1315,13 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
             const anc1 = ancestorPool(seed.i, nodes1, topo1, idx1Map, pool1);
             const anc2 = ancestorPool(seed.j, nodes2, topo2, idx2Map, pool2);
             if (anc1.size > 0 && anc2.size > 0) matchSubgraphs(anc1, anc2);
-
+            
             // Descendant subgraphs — nodes that the seed feeds into
             const desc1 = descendantPool(seed.i, nodes1, topo1, idx1Map, pool1);
             const desc2 = descendantPool(seed.j, nodes2, topo2, idx2Map, pool2);
             if (desc1.size > 0 && desc2.size > 0) matchSubgraphs(desc1, desc2);
 
-            // Remainder — nodes disconnected from the seed within this pool
+            // // Remainder — nodes disconnected from the seed within this pool
             const rem1 = new Set([...pool1].filter(x => x !== seed.i && !anc1.has(x) && !desc1.has(x)));
             const rem2 = new Set([...pool2].filter(x => x !== seed.j && !anc2.has(x) && !desc2.has(x)));
             if (rem1.size > 0 && rem2.size > 0) matchSubgraphs(rem1, rem2);
@@ -1348,6 +1406,132 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
         return new diffAnalyser.ModelDifferences(entries);
     }
 
+    // ----------------------------- Local Topology -----------------------------
+
+    // Recompute typeRelRank within a sub-graph using a local topoRank.
+    // Nodes of the same type are sorted by localTopoRank and assigned ordinal 0, 1, 2…
+    // normalised by MAX_TYPE_COUNT — same convention as the global pass.
+    static _computeLocalTypeRelRank(subNodes, localTopoRank) {
+        const MNA    = diffAnalyser.ModelNodesDiffAnalyzer;
+        const byType = new Map();
+        for (const node of subNodes) {
+            const tn = MNA._getNodeTypeName(node) ?? '__unknown__';
+            if (!byType.has(tn)) byType.set(tn, []);
+            byType.get(tn).push(node);
+        }
+        const typeRelRank = new Map();
+        for (const group of byType.values()) {
+            group.sort((a, b) => (localTopoRank.get(a) ?? 0) - (localTopoRank.get(b) ?? 0));
+            group.forEach((node, i) => typeRelRank.set(node, i / this.MAX_TYPE_COUNT));
+        }
+        return typeRelRank;
+    }
+
+    // Recompute topoRank within a sub-graph (Kahn's BFS restricted to subNodes).
+    // Only topoRank needs to be local; all other topo fields (parentMap, childMap,
+    // inDegree, outDegree) can be reused from the full topology because downstream
+    // consumers (_greedyMatch, _expandMatches, _messagePass) already ignore nodes
+    // that are absent from their local idxMap / fmap.
+    static _computeLocalTopoRank(subNodes, fullTopo) {
+        const nodeSet = new Set(subNodes);
+        const pending = new Map(subNodes.map(n => [
+            n,
+            (fullTopo.parentMap.get(n) ?? []).filter(p => nodeSet.has(p)).length,
+        ]));
+        let queue      = subNodes.filter(n => pending.get(n) === 0);
+        const topoRank = new Map();
+        let rank = 0;
+        while (queue.length > 0) {
+            const next = [];
+            for (const node of queue) {
+                topoRank.set(node, rank);
+                for (const child of (fullTopo.childMap.get(node) ?? [])) {
+                    if (!nodeSet.has(child)) continue;
+                    const cnt = (pending.get(child) ?? 0) - 1;
+                    pending.set(child, cnt);
+                    if (cnt === 0) next.push(child);
+                }
+            }
+            rank++;
+            queue = next;
+        }
+        for (const node of subNodes) {
+            if (!topoRank.has(node)) topoRank.set(node, 0);
+        }
+        return topoRank;
+    }
+
+    // ----------------------------- Sub-graph Splitting -----------------------------
+
+    // Split non-anchor nodes into sub-graphs bounded by anchors.
+    // Each sub-graph includes its start/end anchors.
+    // For each non-anchor node: find the nearest upstream anchor (highest topoRank among ancestors
+    // in anchorSet) and nearest downstream anchor (lowest topoRank among descendants in anchorSet).
+    // Nodes with no upstream ancestor in anchorSet use startNode; those with no downstream
+    // descendant in anchorSet use endNode.
+    static _splitSubgraphs(nodes, anchorSet, topo, startNode, endNode) {
+        // BFS upward: find anchor with highest topoRank among all ancestors
+        const nearestUpAnchor = (node) => {
+            const visited = new Set();
+            const stack   = [...(topo.parentMap.get(node) ?? [])];
+            let best = null, bestRank = -1;
+            while (stack.length > 0) {
+                const n = stack.pop();
+                if (visited.has(n)) continue;
+                visited.add(n);
+                if (anchorSet.has(n)) {
+                    const r = topo.topoRank.get(n) ?? 0;
+                    if (r > bestRank) { bestRank = r; best = n; }
+                    continue; // don't traverse past anchors
+                }
+                for (const p of (topo.parentMap.get(n) ?? [])) stack.push(p);
+            }
+            return best ?? startNode;
+        };
+
+        // BFS downward: find anchor with lowest topoRank among all descendants
+        const nearestDownAnchor = (node) => {
+            const visited = new Set();
+            const stack   = [...(topo.childMap.get(node) ?? [])];
+            let best = null, bestRank = Infinity;
+            while (stack.length > 0) {
+                const n = stack.pop();
+                if (visited.has(n)) continue;
+                visited.add(n);
+                if (anchorSet.has(n)) {
+                    const r = topo.topoRank.get(n) ?? 0;
+                    if (r < bestRank) { bestRank = r; best = n; }
+                    continue;
+                }
+                for (const c of (topo.childMap.get(n) ?? [])) stack.push(c);
+            }
+            return best ?? endNode;
+        };
+
+        // Map<startAnchor, Map<endAnchor, Set<node>>>
+        const sgMap = new Map();
+        const getOrCreate = (up, down) => {
+            if (!sgMap.has(up)) sgMap.set(up, new Map());
+            const inner = sgMap.get(up);
+            if (!inner.has(down)) inner.set(down, new Set([up, down]));
+            return inner.get(down);
+        };
+
+        for (const node of nodes) {
+            if (anchorSet.has(node)) continue;
+            getOrCreate(nearestUpAnchor(node), nearestDownAnchor(node)).add(node);
+        }
+
+        const result = [];
+        for (const [startAnchor, innerMap] of sgMap) {
+            for (const [endAnchor, nodeSet] of innerMap) {
+                const depth = Math.max(...[...nodeSet].map(n => topo.topoRank.get(n) ?? 0));
+                result.push({ startAnchor, endAnchor, nodes: [...nodeSet], depth });
+            }
+        }
+        return result;
+    }
+
     // ----------------------------- Main Entry Point -----------------------------
 
     static compare(model1, model2) {
@@ -1366,35 +1550,157 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
         const rawVocab                      = this._buildVocabulary(nodes1, nodes2);
         const { vocab, groups: compatGroups } = this._buildCompatibilityGroups(rawVocab);
 
-        // 2. Edge graphs (reuse existing infrastructure)
-        const model1Inputs    = diffAnalyser.ModelNodesDiffAnalyzer._getInputs(model1);
-        const model2Inputs    = diffAnalyser.ModelNodesDiffAnalyzer._getInputs(model2);
-        const model1StartNode = new diffAnalyser.StartNode(model1Inputs);
-        const model2StartNode = new diffAnalyser.StartNode(model2Inputs);
-        const edges1 = diffAnalyser.ModelNodesDiffAnalyzer._findEdges(model1, model1StartNode);
-        const edges2 = diffAnalyser.ModelNodesDiffAnalyzer._findEdges(model2, model2StartNode);
+        // 2. Edge graphs + virtual boundary nodes
+        const model1Inputs = diffAnalyser.ModelNodesDiffAnalyzer._getInputs(model1);
+        const model2Inputs = diffAnalyser.ModelNodesDiffAnalyzer._getInputs(model2);
+        const startNode1   = new diffAnalyser.StartNode(model1Inputs);
+        const startNode2   = new diffAnalyser.StartNode(model2Inputs);
+        const endNode1     = new diffAnalyser.EndNode();
+        const endNode2     = new diffAnalyser.EndNode();
+        const edges1 = diffAnalyser.ModelNodesDiffAnalyzer._findEdges(model1, startNode1);
+        const edges2 = diffAnalyser.ModelNodesDiffAnalyzer._findEdges(model2, startNode2);
 
         // 3. Topology
         const topo1 = this._buildTopology(nodes1, edges1);
         const topo2 = this._buildTopology(nodes2, edges2);
 
-        // 4. Feature vectors + message passing
-        let fmap1 = this._buildFeatureVectors(nodes1, topo1, vocab);
-        let fmap2 = this._buildFeatureVectors(nodes2, topo2, vocab);
-        fmap1 = this._messagePass(nodes1, fmap1, topo1, this.MESSAGE_PASS_ROUNDS);
-        fmap2 = this._messagePass(nodes2, fmap2, topo2, this.MESSAGE_PASS_ROUNDS);
+        // 4. Feature vectors for all nodes (no message passing yet)
+        const fmap1 = this._buildFeatureVectors(nodes1, topo1, vocab, compatGroups);
+        const fmap2 = this._buildFeatureVectors(nodes2, topo2, vocab, compatGroups);
 
-        // 5. Cosine similarity with type-compatibility mask
-        const sim = this._buildSimilarityMatrix(nodes1, nodes2, fmap1, fmap2, compatGroups, vocab);
+        // Index maps for translating sub-array indices back to full-array indices
+        const idx1Map = new Map(nodes1.map((n, i) => [n, i]));
+        const idx2Map = new Map(nodes2.map((n, i) => [n, i]));
 
-        // 6. Greedy strong-first matching (neighbor-constrained)
-        const { assignments, matched1, matched2 } = this._greedyMatch(nodes1, nodes2, sim, this.SOFT_MATCH_THRESHOLD, topo1, topo2);
+        // ── PASS 1: match multiconnection nodes ──────────────────────────────
+        const isMulti    = (n, topo) => (topo.inDegree.get(n) ?? 0) > 1 || (topo.outDegree.get(n) ?? 0) > 1;
+        const multiNodes1 = nodes1.filter(n => isMulti(n, topo1));
+        const multiNodes2 = nodes2.filter(n => isMulti(n, topo2));
 
-        // 7. Local graph expansion for unmatched nodes
-        this._expandMatches(assignments, matched1, matched2, nodes1, nodes2, topo1, topo2, sim, nodes2.length);
+        // Slice fmaps to multiconnection nodes and message-pass
+        let fmapM1 = new Map(multiNodes1.map(n => [n, fmap1.get(n)]));
+        let fmapM2 = new Map(multiNodes2.map(n => [n, fmap2.get(n)]));
+        fmapM1 = this._messagePass(multiNodes1, fmapM1, topo1, this.MESSAGE_PASS_ROUNDS + 1);
+        fmapM2 = this._messagePass(multiNodes2, fmapM2, topo2, this.MESSAGE_PASS_ROUNDS + 1);
 
-        // 8. Build ModelDifferences output
-        return this._buildModelDifferences(assignments, nodes1, nodes2);
+        // Similarity with strict inDegree+outDegree constraint
+        const simPass1 = this._buildSimilarityMatrix(
+            multiNodes1, multiNodes2, fmapM1, fmapM2, compatGroups, vocab, topo1, topo2, true
+        );
+        const pass1 = this._greedyMatch(multiNodes1, multiNodes2, simPass1, this.SOFT_MATCH_THRESHOLD, topo1, topo2);
+
+        // Remap pass-1 assignments to full-array indices
+        const allAssignments = pass1.assignments.map(a => ({
+            idx1:  idx1Map.get(multiNodes1[a.idx1]),
+            idx2:  idx2Map.get(multiNodes2[a.idx2]),
+            score: a.score,
+        }));
+
+        // Anchors = matched multiNodes + virtual start/end
+        const anchorSet1 = new Set([startNode1, endNode1, ...pass1.assignments.map(a => multiNodes1[a.idx1])]);
+        const anchorSet2 = new Set([startNode2, endNode2, ...pass1.assignments.map(a => multiNodes2[a.idx2])]);
+
+        // anchor1 → anchor2 pairing map
+        const anchorMatchMap = new Map([[startNode1, startNode2], [endNode1, endNode2]]);
+        for (const a of pass1.assignments) {
+            anchorMatchMap.set(multiNodes1[a.idx1], multiNodes2[a.idx2]);
+        }
+
+        // ── PASS 2: sub-graph matching ────────────────────────────────────────
+        const subgraphs1 = this._splitSubgraphs(nodes1, anchorSet1, topo1, startNode1, endNode1); // TODO: Is it afficient?
+        const subgraphs2 = this._splitSubgraphs(nodes2, anchorSet2, topo2, startNode2, endNode2);
+
+        // Key sub-graphs in model2 by their (startAnchor, endAnchor) for O(1) lookup
+        const sg2Key = (sg) => {
+            const s = sg.startAnchor === startNode2 ? 'S' : idx2Map.get(sg.startAnchor);
+            const e = sg.endAnchor   === endNode2   ? 'E' : idx2Map.get(sg.endAnchor);
+            return `${s}_${e}`;
+        };
+        const sg2ByAnchors = new Map(subgraphs2.map(sg => [sg2Key(sg), sg]));
+
+        // Pair each model1 sub-graph with its model2 counterpart via anchor match
+        const pairs = [];
+        for (const sg1 of subgraphs1) {
+            const mStart = anchorMatchMap.get(sg1.startAnchor);
+            const mEnd   = anchorMatchMap.get(sg1.endAnchor);
+            if (!mStart || !mEnd) continue;
+            const s2 = mStart === startNode2 ? 'S' : idx2Map.get(mStart);
+            const e2 = mEnd   === endNode2   ? 'E' : idx2Map.get(mEnd);
+            const sg2 = sg2ByAnchors.get(`${s2}_${e2}`);
+            if (sg2) pairs.push({ sg1, sg2, depth: Math.max(sg1.depth, sg2.depth) });
+        }
+        pairs.sort((a, b) => b.depth - a.depth); // deepest first
+
+        const matched1 = new Set(allAssignments.map(a => a.idx1));
+        const matched2 = new Set(allAssignments.map(a => a.idx2));
+
+        for (const { sg1, sg2 } of pairs) {
+            // Reuse global topo scalars; recompute topoRank locally and filter
+            // parentMap/childMap to sub-graph nodes so message passing stays local.
+            const lTopoRank1 = this._computeLocalTopoRank(sg1.nodes, topo1);
+            const lTopoRank2 = this._computeLocalTopoRank(sg2.nodes, topo2);
+            const sgSet1 = new Set(sg1.nodes);
+            const sgSet2 = new Set(sg2.nodes);
+            const lTopo1 = {
+                ...topo1,
+                topoRank:  lTopoRank1,
+                parentMap: new Map(sg1.nodes.map(n => [n, (topo1.parentMap.get(n) ?? []).filter(p => sgSet1.has(p))])),
+                childMap:  new Map(sg1.nodes.map(n => [n, (topo1.childMap.get(n)  ?? []).filter(c => sgSet1.has(c))])),
+            };
+            const lTopo2 = {
+                ...topo2,
+                topoRank:  lTopoRank2,
+                parentMap: new Map(sg2.nodes.map(n => [n, (topo2.parentMap.get(n) ?? []).filter(p => sgSet2.has(p))])),
+                childMap:  new Map(sg2.nodes.map(n => [n, (topo2.childMap.get(n)  ?? []).filter(c => sgSet2.has(c))])),
+            };
+
+            // Only process unmatched, real (non-virtual) nodes for sim + matching
+            const unmatchedSg1 = sg1.nodes.filter(n => { const i = idx1Map.get(n); return i !== undefined && !matched1.has(i); });
+            const unmatchedSg2 = sg2.nodes.filter(n => { const j = idx2Map.get(n); return j !== undefined && !matched2.has(j); });
+            if (unmatchedSg1.length === 0 || unmatchedSg2.length === 0) continue;
+
+            // Reuse global feature vectors; patch vec[2] (local topoRank) and vec[3] (local typeRelRank)
+            const maxRank1      = Math.max(1, ...[...lTopoRank1.values()]);
+            const maxRank2      = Math.max(1, ...[...lTopoRank2.values()]);
+            const lTypeRelRank1 = this._computeLocalTypeRelRank(sg1.nodes, lTopoRank1);
+            const lTypeRelRank2 = this._computeLocalTypeRelRank(sg2.nodes, lTopoRank2);
+            const patchLocal = (n, fmapGlobal, lRank, maxRank, lTypeRank) => {
+                const vec = fmapGlobal.get(n).slice();
+                vec[2] = (lRank.get(n)     ?? 0) / maxRank;
+                vec[3] =  lTypeRank.get(n) ?? 0;
+                return vec;
+            };
+            // Include real anchor nodes in fmap so their features are visible to neighbours
+            // during message passing, but only iterate unmatched nodes for updates.
+            const sgRealNodes1 = sg1.nodes.filter(n => fmap1.has(n));
+            const sgRealNodes2 = sg2.nodes.filter(n => fmap2.has(n));
+            let fmapSg1 = new Map(sgRealNodes1.map(n => [n, patchLocal(n, fmap1, lTopoRank1, maxRank1, lTypeRelRank1)]));
+            let fmapSg2 = new Map(sgRealNodes2.map(n => [n, patchLocal(n, fmap2, lTopoRank2, maxRank2, lTypeRelRank2)]));
+            fmapSg1 = this._messagePass(unmatchedSg1, fmapSg1, lTopo1, this.MESSAGE_PASS_ROUNDS); 
+            fmapSg2 = this._messagePass(unmatchedSg2, fmapSg2, lTopo2, this.MESSAGE_PASS_ROUNDS);
+
+            const simSg    = this._buildSimilarityMatrix(unmatchedSg1, unmatchedSg2, fmapSg1, fmapSg2, compatGroups, vocab);
+            const sgResult = this._greedyMatch(unmatchedSg1, unmatchedSg2, simSg, this.SOFT_MATCH_THRESHOLD, lTopo1, lTopo2);
+
+            // Expand within this sub-graph before moving on (local indices, local sim)
+            const sgMatched1 = new Set(sgResult.assignments.map(a => a.idx1));
+            const sgMatched2 = new Set(sgResult.assignments.map(a => a.idx2));
+            this._expandMatches(sgResult.assignments, sgMatched1, sgMatched2, unmatchedSg1, unmatchedSg2, lTopo1, lTopo2, simSg, unmatchedSg2.length);
+
+            // Promote to global index space
+            for (const a of sgResult.assignments) {
+                const gi1 = idx1Map.get(unmatchedSg1[a.idx1]);
+                const gi2 = idx2Map.get(unmatchedSg2[a.idx2]);
+                if (gi1 !== undefined && gi2 !== undefined && !matched1.has(gi1) && !matched2.has(gi2)) {
+                    allAssignments.push({ idx1: gi1, idx2: gi2, score: a.score });
+                    matched1.add(gi1);
+                    matched2.add(gi2);
+                }
+            }
+        }
+
+        // Build output
+        return this._buildModelDifferences(allAssignments, nodes1, nodes2);
     }
 };
 
