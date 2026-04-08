@@ -625,6 +625,7 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
     // Multiplier for vec[0] (node typeIdx). Values > 1 increase its weight
     // in cosine similarity relative to all other structural features.
     static TYPE_IDX_SCALE = 3.0;
+    static DEBUG = false;
 
     // ----------------------------- Type Vocabulary -----------------------------
 
@@ -1232,6 +1233,8 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
 
         const matched1    = new Set();
         const matched2    = new Set();
+        const processed1  = new Set(); // matched + dead-end pool (other side empty)
+        const processed2  = new Set();
         const assignments = [];
 
         // Transitive ancestors of nodes[nodeIdx], restricted to the given pool.
@@ -1272,26 +1275,15 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
         };
 
         // Best unmatched pair in pool1 × pool2 above threshold; null if none found.
-        // Priority boosts pairs where both nodes share the same inDegree AND outDegree:
-        // structurally identical high-connectivity nodes (Add, Concat, multi-output splits)
-        // become preferred seeds over lower-connectivity nodes with equal similarity.
-        const degOf = (ni, nodes, topo) => {
-            const n = nodes[ni];
-            return { in: topo.inDegree.get(n) ?? 0, out: topo.outDegree.get(n) ?? 0 };
-        };
         const bestInPools = (pool1, pool2) => {
             let bestI = -1, bestJ = -1, bestPriority = -Infinity;
             for (const ni of pool1) {
                 if (matched1.has(ni)) continue;
-                const d1 = degOf(ni, nodes1, topo1);
                 for (const nj of pool2) {
                     if (matched2.has(nj)) continue;
                     const s = sim[ni * n2 + nj];
                     if (s <= threshold) continue;
-                    const d2       = degOf(nj, nodes2, topo2);
-                    const sameConn = d1.in === d2.in && d1.out === d2.out;
-                    const priority = sameConn ? s * Math.log2(2 + d1.in + d1.out) : s;
-                    if (priority > bestPriority) { bestPriority = priority; bestI = ni; bestJ = nj; }
+                    if (s > bestPriority) { bestPriority = s; bestI = ni; bestJ = nj; }
                 }
             }
             return bestI !== -1 ? { i: bestI, j: bestJ } : null;
@@ -1300,6 +1292,8 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
         const assign = (i, j) => {
             matched1.add(i);
             matched2.add(j);
+            processed1.add(i);
+            processed2.add(j);
             assignments.push({ idx1: i, idx2: j, score: sim[i * n2 + j] });
         };
 
@@ -1310,21 +1304,42 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
             const seed = bestInPools(pool1, pool2);
             if (!seed) return;
             assign(seed.i, seed.j);
+            if (this.DEBUG) {
+                console.log('Pool 1:', [...pool1].map(i => nodes1[i].name).join(', '));
+                console.log('Pool 2:', [...pool2].map(j => nodes2[j].name).join(', '));
+                console.log(`Matched nodes: ${seed.i}:${nodes1[seed.i].name} and ${seed.j}:${nodes2[seed.j].name} with similarity ${sim[seed.i * n2 + seed.j].toFixed(4)}`);
+            }
 
             // Ancestor subgraphs — nodes that feed into the seed
             const anc1 = ancestorPool(seed.i, nodes1, topo1, idx1Map, pool1);
             const anc2 = ancestorPool(seed.j, nodes2, topo2, idx2Map, pool2);
-            if (anc1.size > 0 && anc2.size > 0) matchSubgraphs(anc1, anc2);
-            
+            if (anc1.size > 0 && anc2.size > 0) {
+                matchSubgraphs(anc1, anc2);
+            } else {
+                // One side is empty — the other side's nodes were processed but couldn't match
+                for (const x of anc1) processed1.add(x);
+                for (const x of anc2) processed2.add(x);
+            }
+
             // Descendant subgraphs — nodes that the seed feeds into
             const desc1 = descendantPool(seed.i, nodes1, topo1, idx1Map, pool1);
             const desc2 = descendantPool(seed.j, nodes2, topo2, idx2Map, pool2);
-            if (desc1.size > 0 && desc2.size > 0) matchSubgraphs(desc1, desc2);
+            if (desc1.size > 0 && desc2.size > 0) {
+                matchSubgraphs(desc1, desc2);
+            } else {
+                for (const x of desc1) processed1.add(x);
+                for (const x of desc2) processed2.add(x);
+            }
 
-            // // Remainder — nodes disconnected from the seed within this pool
+            // Remainder — nodes disconnected from the seed within this pool
             const rem1 = new Set([...pool1].filter(x => x !== seed.i && !anc1.has(x) && !desc1.has(x)));
             const rem2 = new Set([...pool2].filter(x => x !== seed.j && !anc2.has(x) && !desc2.has(x)));
-            if (rem1.size > 0 && rem2.size > 0) matchSubgraphs(rem1, rem2);
+            if (rem1.size > 0 && rem2.size > 0) {
+                matchSubgraphs(rem1, rem2);
+            } else {
+                for (const x of rem1) processed1.add(x);
+                for (const x of rem2) processed2.add(x);
+            }
         };
 
         matchSubgraphs(
@@ -1332,12 +1347,12 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
             new Set(nodes2.map((_, i) => i))
         );
 
-        return { assignments, matched1, matched2 };
+        return { assignments, matched1, matched2, processed1, processed2 };
     }
 
     // ----------------------------- Local Graph Expansion -----------------------------
 
-    static _expandMatches(assignments, matched1, matched2, nodes1, nodes2, topo1, topo2, sim, n2) {
+    static _expandMatches(assignments, matched1, matched2, processed1, processed2, nodes1, nodes2, topo1, topo2, sim, n2) {
         const THRESH = this.EXPANSION_THRESHOLD;
 
         const idx1Map   = new Map(nodes1.map((n, i) => [n, i]));
@@ -1351,7 +1366,7 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
                 if (nbrIdx1 === undefined || !assignMap.has(nbrIdx1)) continue;
                 for (const cand2 of getCands2(nodes2[assignMap.get(nbrIdx1)])) {
                     const j = idx2Map.get(cand2);
-                    if (j === undefined || matched2.has(j)) continue;
+                    if (j === undefined || processed2.has(j)) continue;
                     const s = sim[i * n2 + j];
                     if (s > bestScore) { bestScore = s; bestJ = j; }
                 }
@@ -1363,7 +1378,7 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
         while (changed) {
             changed = false;
             for (let i = 0; i < nodes1.length; i++) {
-                if (matched1.has(i)) continue;
+                if (processed1.has(i)) continue;
                 const node1 = nodes1[i];
 
                 // node1 comes AFTER its parents → its match must come after the matched parent
@@ -1685,7 +1700,7 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
             // Expand within this sub-graph before moving on (local indices, local sim)
             const sgMatched1 = new Set(sgResult.assignments.map(a => a.idx1));
             const sgMatched2 = new Set(sgResult.assignments.map(a => a.idx2));
-            this._expandMatches(sgResult.assignments, sgMatched1, sgMatched2, unmatchedSg1, unmatchedSg2, lTopo1, lTopo2, simSg, unmatchedSg2.length);
+            this._expandMatches(sgResult.assignments, sgMatched1, sgMatched2, sgResult.processed1, sgResult.processed2, unmatchedSg1, unmatchedSg2, lTopo1, lTopo2, simSg, unmatchedSg2.length);
 
             // Promote to global index space
             for (const a of sgResult.assignments) {
