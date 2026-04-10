@@ -629,6 +629,58 @@ view.View = class {
     }
 
     find() {
+        if (this._sidebar.identifier === 'find') return;
+        const p0 = this._panels[0];
+        const p1 = this._panels[1];
+        const has0 = !p0.isPanelEmpty();
+        const has1 = !p1.isPanelEmpty();
+        if (!has0 && !has1) return;
+
+        if (has0 && p0.target) p0.target.select(null);
+        if (has1 && p1.target) p1.target.select(null);
+
+        let sidebar;
+        if (has0 && has1) {
+            sidebar = new view.DoubleFindSidebar(this, this._find,
+                p0.activeTarget, p0.activeSignature,
+                p1.activeTarget, p1.activeSignature);
+            sidebar.on('state-changed', (sender, state) => { this._find = state; });
+            sidebar.on('select', (sender, { panelIdx, value }) => {
+                const t = this._panels[panelIdx].target;
+                if (t) t.scrollTo(t.select([value]));
+            });
+            sidebar.on('focus', (sender, { panelIdx, value }) => {
+                const t = this._panels[panelIdx].target;
+                if (t) t.focus([value]);
+            });
+            sidebar.on('blur', (sender, { panelIdx, value }) => {
+                const t = this._panels[panelIdx].target;
+                if (t) t.blur([value]);
+            });
+            sidebar.on('activate', (sender, { panelIdx, value }) => {
+                this._sidebar.close();
+                const t = this._panels[panelIdx].target;
+                if (t) t.scrollTo(t.activate(value));
+            });
+        } else {
+            const panel = has0 ? p0 : p1;
+            sidebar = new view.FindSidebar(this, this._find, panel.activeTarget, panel.activeSignature);
+            sidebar.on('state-changed', (sender, state) => { this._find = state; });
+            sidebar.on('select', (sender, value) => {
+                if (panel.target) panel.target.scrollTo(panel.target.select([value]));
+            });
+            sidebar.on('focus', (sender, value) => {
+                if (panel.target) panel.target.focus([value]);
+            });
+            sidebar.on('blur', (sender, value) => {
+                if (panel.target) panel.target.blur([value]);
+            });
+            sidebar.on('activate', (sender, value) => {
+                this._sidebar.close();
+                if (panel.target) panel.target.scrollTo(panel.target.activate(value));
+            });
+        }
+        this._sidebar.open(sidebar, 'Find');
     }
 }
 
@@ -704,30 +756,6 @@ view.Panel = class {
         }
     }
 
-    // TODO: Find Feature
-    find() {
-        if (this._target && this._sidebar.identifier !== 'find') {
-            this._target.select(null);
-            const sidebar = new view.FindSidebar(this, this._find, this.activeTarget, this.activeSignature);
-            sidebar.on('state-changed', (sender, state) => {
-                this._find = state;
-            });
-            sidebar.on('select', (sender, value) => {
-                this._target.scrollTo(this._target.select([value]));
-            });
-            sidebar.on('focus', (sender, value) => {
-                this._target.focus([value]);
-            });
-            sidebar.on('blur', (sender, value) => {
-                this._target.blur([value]);
-            });
-            sidebar.on('activate', (sender, value) => {
-                this._sidebar.close();
-                this._target.scrollTo(this._target.activate(value));
-            });
-            this._sidebar.open(sidebar, 'Find');
-        }
-    }
     get model() {
         return this._model;
     }
@@ -4766,6 +4794,194 @@ view.FindSidebar = class extends view.Control {
         const message = this.createTextNode(` ${error.message}`);
         element.appendChild(message);
         this._content.appendChild(element);
+    }
+};
+
+view.DoubleFindSidebar = class extends view.FindSidebar {
+
+    constructor(context, state, graph1, signature1, graph2, signature2) {
+        super(context, state, graph1, signature1);
+        this._graph2 = graph2;
+        this._signature2 = signature2;
+        this._state.modelA = this._state.modelA !== false;
+        this._state.modelB = this._state.modelB !== false;
+        this._modelToggles = {
+            modelA: { hide: 'Hide Model A', show: 'Show Model A' },
+            modelB: { hide: 'Hide Model B', show: 'Show Model B' }
+        };
+    }
+
+    // Override: _edges keyed by "panelIdx:name" to avoid cross-model dedup
+    _edge(value, panelIdx) {
+        const key = `${panelIdx}:${value.name}`;
+        if (value.name && !this._edges.has(key) && this._value(value)) {
+            const content = value.name.split('\n').shift();
+            this._add(value, content, 'connection', panelIdx);
+            this._edges.add(key);
+        }
+    }
+
+    // Override: wrap value with panelIdx; prefix content with model label
+    _add(value, content, type, panelIdx) {
+        if (!this._toggles[type].template) {
+            const element = this.createElement('li');
+            element.innerHTML = `<svg class='sidebar-find-content-icon'><use href="#sidebar-icon-${type}"></use></svg>`;
+            this._toggles[type].template = element;
+        }
+        const element = this._toggles[type].template.cloneNode(true);
+        const label = panelIdx === 0 ? 'A' : 'B';
+        const text = this._host.document.createTextNode(`${label}: ${content}`);
+        element.appendChild(text);
+        element.setAttribute('data-model', label);
+        this._table.set(element, { panelIdx, value });
+        this._content.appendChild(element);
+    }
+
+    // Override: include panelIdx in emitted event
+    _focus(element) {
+        if (this._table.has(element)) {
+            this.emit('focus', this._table.get(element));
+            this._focused.add(element);
+        }
+    }
+
+    _blur(element) {
+        if (this._table.has(element)) {
+            this.emit('blur', this._table.get(element));
+            this._focused.delete(element);
+        }
+    }
+
+    // Override: search a single graph and emit panelIdx-tagged results
+    _searchGraph(graph, signature, panelIdx) {
+        const inputs = signature ? signature.inputs : graph.inputs;
+        if (this._state.connection) {
+            for (const input of inputs) {
+                for (const value of input.value) {
+                    this._edge(value, panelIdx);
+                }
+            }
+        }
+        for (const node of graph.nodes) {
+            this._nodeForPanel(node, panelIdx);
+        }
+        if (this._state.connection) {
+            const outputs = signature ? signature.outputs : graph.outputs;
+            for (const output of outputs) {
+                if (!output.type || output.type.endsWith('*')) {
+                    for (const value of output.value) {
+                        this._edge(value, panelIdx);
+                    }
+                }
+            }
+        }
+    }
+
+    // Renamed from _node to avoid collision with parent; same logic but panelIdx-aware
+    _nodeForPanel(node, panelIdx) {
+        if (this._state.connection) {
+            const inputs = node.inputs;
+            if (Array.isArray(inputs)) {
+                for (const input of inputs) {
+                    if (!input.type || input.type.endsWith('*')) {
+                        for (const value of input.value) {
+                            if (value !== null && !value.initializer) {
+                                this._edge(value, panelIdx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (this._state.node) {
+            const name = node.name;
+            const type = node.type.name;
+            const identifier = node.identifier;
+            if ((name && this._term(name)) || (type && this._term(type)) || (identifier && this._term(identifier))) {
+                this._add(node, `${name || `[${type}]`}`, 'node', panelIdx);
+            }
+        }
+        if (this._state.weight) {
+            const inputs = node.inputs;
+            if (Array.isArray(inputs)) {
+                for (const argument of inputs) {
+                    if (!argument.type || argument.type.endsWith('*')) {
+                        for (const value of argument.value) {
+                            if (value !== null && value.initializer && this._value(value)) {
+                                let content = null;
+                                if (value.name) {
+                                    content = value.name.split('\n').shift();
+                                } else if (Array.isArray(argument.value) && argument.value.length === 1 && argument.name.indexOf('.') !== -1) {
+                                    content = argument.name;
+                                } else if (value.type && value.type.shape && Array.isArray(value.type.shape.dimensions) && value.type.shape.dimensions.length > 0) {
+                                    content = value.type.shape.dimensions.map((d) => (d !== null && d !== undefined) ? d : '?').join('\u00D7');
+                                }
+                                if (content) {
+                                    const target = argument.value.length === 1 ? argument : node;
+                                    this._add(target, content, 'weight', panelIdx);
+                                }
+                            }
+                        }
+                    } else if (argument.type === 'object') {
+                        this._nodeForPanel(argument.value, panelIdx);
+                    } else if (argument.type === 'object[]') {
+                        for (const value of argument.value) {
+                            this._nodeForPanel(value, panelIdx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Override: iterate both graphs with model visibility guards
+    _update() {
+        try {
+            this._reset();
+            if (this._state.modelA && this._target) {
+                this._searchGraph(this._target, this._signature, 0);
+            }
+            if (this._state.modelB && this._graph2) {
+                this._searchGraph(this._graph2, this._signature2, 1);
+            }
+        } catch (error) {
+            this.error(error, false);
+        }
+    }
+
+    // Override: add model A/B toggles after the base render
+    render() {
+        super.render();
+        for (const [name, toggle] of Object.entries(this._modelToggles)) {
+            const label = name === 'modelA' ? 'A' : 'B';
+            toggle.element = this.createElement('label', 'sidebar-find-toggle');
+            const span = this.createElement('span', 'sidebar-find-model-label');
+            span.textContent = label;
+            toggle.element.appendChild(span);
+            toggle.element.setAttribute('title', this._state[name] ? toggle.hide : toggle.show);
+            toggle.checkbox = this.createElement('input');
+            toggle.checkbox.setAttribute('type', 'checkbox');
+            toggle.checkbox.setAttribute('data', name);
+            toggle.checkbox.addEventListener('change', (e) => {
+                const n = e.target.getAttribute('data');
+                this._state[n] = e.target.checked;
+                const t = this._modelToggles[n];
+                t.element.setAttribute('title', e.target.checked ? t.hide : t.show);
+                this.emit('state-changed', this._state);
+                this._update();
+            });
+            toggle.element.insertBefore(toggle.checkbox, toggle.element.firstChild);
+            this._search.appendChild(toggle.element);
+        }
+    }
+
+    // Override: also init model A/B checkboxes
+    activate() {
+        super.activate();
+        for (const [name, toggle] of Object.entries(this._modelToggles)) {
+            toggle.checkbox.checked = this._state[name];
+            toggle.element.setAttribute('title', this._state[name] ? toggle.hide : toggle.show);
+        }
     }
 };
 
