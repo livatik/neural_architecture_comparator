@@ -583,6 +583,8 @@ browser.Host = class {
         else {
             this.document.title = '';
         }
+
+        this._view.updatePanelVisibility();
     }
 
     async _openGist(gist) {

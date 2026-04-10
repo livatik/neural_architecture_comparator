@@ -22,7 +22,7 @@ button { font-family: -apple-system, BlinkMacSystemFont, "Segoe WPC", "Segoe UI"
 .center { position: absolute; margin: auto; top: 0; right: 0; bottom: 0; left: 0; user-select: none; -webkit-user-select: none; -moz-user-select: none; }
 .select { user-select: text; -webkit-user-select: text; -moz-user-select: text; }
 .target, .left-panel, .right-panel { display: flex; height: 100%; width: 100%; overflow: auto; outline: none; touch-action: pan-x pan-y; }
-.canvas, .left-panel-canvas, .right-panel-canvas { margin: auto; flex-shrink: 0; text-rendering: geometricPrecision; user-select: none; -webkit-user-select: none; -moz-user-select: none; }
+.canvas, .left-panel-canvas, .right-panel-canvas { display: block; margin: 0 auto; flex-shrink: 0; text-rendering: geometricPrecision; user-select: none; -webkit-user-select: none; -moz-user-select: none; }
 .default { background-color: #ffffff; }
 .default .logo { display: none; }
 .default .target { display: flex; opacity: 1; }
@@ -326,6 +326,12 @@ button { font-family: -apple-system, BlinkMacSystemFont, "Segoe WPC", "Segoe UI"
 }
 .panel:last-child {
     border-right: none;
+}
+.single-model .panel {
+    width: 100%;
+}
+.single-model .panel.panel-hidden {
+    display: none;
 }
 .model-container {
     width: 100%;

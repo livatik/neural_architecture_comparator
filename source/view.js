@@ -292,6 +292,18 @@ view.View = class {
         }
     }
 
+    updatePanelVisibility() {
+        const target   = document.getElementById('target');
+        const el0      = document.getElementById('left-panel');
+        const el1      = document.getElementById('right-panel');
+        const has0     = !this._panels[0].isPanelEmpty();
+        const has1     = !this._panels[1].isPanelEmpty();
+        const isSingle = has0 !== has1; // exactly one panel has a model
+        target.classList.toggle('single-model', isSingle);
+        if (el0) el0.classList.toggle('panel-hidden', isSingle && !has0);
+        if (el1) el1.classList.toggle('panel-hidden', isSingle && !has1);
+    }
+
     enableScrollSync() {
         const panelLeft  = document.querySelector('#left-panel');
         const panelRight = document.querySelector('#right-panel');
