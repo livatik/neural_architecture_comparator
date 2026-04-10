@@ -54,7 +54,9 @@ button { font-family: -apple-system, BlinkMacSystemFont, "Segoe WPC", "Segoe UI"
 .welcome .message-text a:visited { color: inherit; }
 .welcome .message-text a:hover { color: #242424; text-decoration: underline; }
 .message-button { display: inline; text-align: center; width: 125px; margin-left: auto; margin-right: auto; }
-.logo-text { top: -57px; width: 582px; transition: 0.1s; }
+.logo-text { top: -57px; width: 680px; transition: 0.1s; }
+.logo-net { fill: #2563EB; }
+.logo-compare { fill: #1a1a1a; }
 .logo-name { top: -170px; width: 582px; transition: 0.1s; }
 .logo-icon { left: 248px; top: -18px; width: 106px; height: 106px; transition: 0.1s; }
 .logo-spinner { left: 248px; top: -18px; width: 106px; height: 106px; display: none; }
@@ -153,6 +155,7 @@ button { font-family: -apple-system, BlinkMacSystemFont, "Segoe WPC", "Segoe UI"
 .logo-border { stroke: #000000; }
 .logo-glyph { fill: #888888; }
 .logo-spinner-stroke { stroke: #ffffff; }
+.logo-compare { fill: #cccccc; }
 .logo-button, .file-input { color: #888888; background-color: #1e1e1e; border-color: #888888; }
 .logo-button:hover, .file-input:hover { color: #1e1e1e; background-color: #888888; }
 .welcome .progress-bar { background-color: #888888; }
@@ -500,14 +503,20 @@ button { font-family: -apple-system, BlinkMacSystemFont, "Segoe WPC", "Segoe UI"
     <div class="logo-stack">
         <!-- Logo visuals (keep your existing SVGs) -->
         <a href="https://github.com/livatik/netcompare" target="blank_">
-            <svg class="logo-text" viewBox="0 0 1500 250" xmlns="http://www.w3.org/2000/svg">
-                <rect width="100%" height="100%" fill="#ececec"/>
-                <text x="50" y="180"
-                        font-family="Inter, Arial, Helvetica, sans-serif"
-                        font-weight="500"
-                        font-size="180"
-                        letter-spacing="15"
-                        fill="black">NETCOMPARE</text>
+            <svg class="logo-text" viewBox="0 0 1500 220" xmlns="http://www.w3.org/2000/svg">
+                <defs>
+                    <linearGradient id="netGradient" x1="0" y1="0" x2="1" y2="1">
+                        <stop offset="0%" stop-color="#2563EB"/>
+                        <stop offset="100%" stop-color="#7C3AED"/>
+                    </linearGradient>
+                </defs>
+                <text x="750" y="178"
+                        text-anchor="middle"
+                        font-family="Inter, 'Segoe UI', Arial, Helvetica, sans-serif"
+                        font-size="175"
+                        letter-spacing="6">
+                    <tspan class="logo-net" font-weight="800" fill="url(#netGradient)">NET</tspan><tspan class="logo-compare" font-weight="200" letter-spacing="14">COMPARE</tspan>
+                </text>
             </svg>
 
             <!-- <svg id="logo-spinner" class="logo-spinner" viewbox="0 0 1024 1024">
