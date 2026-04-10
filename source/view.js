@@ -643,7 +643,9 @@ view.View = class {
         if (has0 && has1) {
             sidebar = new view.DoubleFindSidebar(this, this._find,
                 p0.activeTarget, p0.activeSignature,
-                p1.activeTarget, p1.activeSignature);
+                p1.activeTarget, p1.activeSignature,
+                this._differences?.model1NodeInfos ?? null,
+                this._differences?.model2NodeInfos ?? null);
             sidebar.on('state-changed', (sender, state) => { this._find = state; });
             sidebar.on('select', (sender, { panelIdx, value }) => {
                 const t = this._panels[panelIdx].target;
@@ -4799,10 +4801,12 @@ view.FindSidebar = class extends view.Control {
 
 view.DoubleFindSidebar = class extends view.FindSidebar {
 
-    constructor(context, state, graph1, signature1, graph2, signature2) {
+    constructor(context, state, graph1, signature1, graph2, signature2, nodeInfos1 = null, nodeInfos2 = null) {
         super(context, state, graph1, signature1);
         this._graph2 = graph2;
         this._signature2 = signature2;
+        this._nodeInfos1 = nodeInfos1;
+        this._nodeInfos2 = nodeInfos2;
         this._state.modelA = this._state.modelA !== false;
         this._state.modelB = this._state.modelB !== false;
         this._modelToggles = {
@@ -4821,7 +4825,8 @@ view.DoubleFindSidebar = class extends view.FindSidebar {
         }
     }
 
-    // Override: wrap value with panelIdx; prefix content with model label
+    // Override: wrap value with panelIdx; prefix content with model label;
+    // attach grapher-compatible highlight/sync listeners for matched nodes.
     _add(value, content, type, panelIdx) {
         if (!this._toggles[type].template) {
             const element = this.createElement('li');
@@ -4834,6 +4839,67 @@ view.DoubleFindSidebar = class extends view.FindSidebar {
         element.appendChild(text);
         element.setAttribute('data-model', label);
         this._table.set(element, { panelIdx, value });
+
+        if (type === 'node') {
+            const nodeInfos = panelIdx === 0 ? this._nodeInfos1 : this._nodeInfos2;
+            const nodeId = nodeInfos?.getNodeInfo?.(value)?.nodeID;
+            if (nodeId !== null && nodeId !== undefined) {
+                const nodeIdStr = String(nodeId);
+                const NODE_MATCH_CLASS = 'node-match-highlight';
+                const findMatches = (id) => document.querySelectorAll(`[data-node-id='${CSS.escape(id)}']`);
+                element.dataset.nodeId = nodeIdStr;
+                element.addEventListener('mouseenter', () =>
+                    findMatches(nodeIdStr).forEach((el) => el.classList.add(NODE_MATCH_CLASS)));
+                element.addEventListener('mouseleave', () =>
+                    findMatches(nodeIdStr).forEach((el) => el.classList.remove(NODE_MATCH_CLASS)));
+                element.addEventListener('click', () => {
+                    const getPanel = (el) => el?.closest?.('.panel') || null;
+                    const prefersReducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
+                    const masterPanel = getPanel(element);
+
+                    if (!masterPanel) {
+                        // Sidebar click: the 'select' event (from the ol listener) scrolls the
+                        // clicked node's panel. Scroll ALL other panels to their matched nodes.
+                        const graphMatches = Array.from(findMatches(nodeIdStr)).filter((el) => getPanel(el));
+                        for (const node of graphMatches) {
+                            const panel = getPanel(node);
+                            const nodeRect  = node.getBoundingClientRect();
+                            const panelRect = panel.getBoundingClientRect();
+                            panel.scrollTo({
+                                top:      Math.max(0, panel.scrollTop  + (nodeRect.top  - panelRect.top)  - panelRect.height / 2),
+                                left:     Math.max(0, panel.scrollLeft + (nodeRect.left - panelRect.left) - panelRect.width  / 2),
+                                behavior: prefersReducedMotion ? 'auto' : 'smooth'
+                            });
+                        }
+                        return;
+                    }
+
+                    // Graph node click: same master/slave sync as grapher
+                    const matchedNodes = Array.from(findMatches(nodeIdStr));
+                    if (matchedNodes.length < 2) return;
+                    let masterNode, slaveNode;
+                    if (masterPanel === getPanel(matchedNodes[0])) {
+                        masterNode = matchedNodes[0]; slaveNode = matchedNodes[1];
+                    } else {
+                        masterNode = matchedNodes[1]; slaveNode = matchedNodes[0];
+                    }
+                    const slavePanel = getPanel(slaveNode);
+                    if (!slavePanel) return;
+                    const masterNodeRect  = masterNode.getBoundingClientRect();
+                    const slaveNodeRect   = slaveNode.getBoundingClientRect();
+                    const masterPanelRect = masterPanel.getBoundingClientRect();
+                    const slavePanelRect  = slavePanel.getBoundingClientRect();
+                    const deltaY = (slaveNodeRect.top  - slavePanelRect.top)  - (masterNodeRect.top  - masterPanelRect.top);
+                    const deltaX = (slaveNodeRect.left - slavePanelRect.left) - (masterNodeRect.left - masterPanelRect.left);
+                    slavePanel.scrollTo({
+                        top:      Math.max(0, slavePanel.scrollTop  + deltaY),
+                        left:     Math.max(0, slavePanel.scrollLeft + deltaX),
+                        behavior: prefersReducedMotion ? 'auto' : 'smooth'
+                    });
+                });
+            }
+        }
+
         this._content.appendChild(element);
     }
 
