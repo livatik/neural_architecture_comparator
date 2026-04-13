@@ -255,7 +255,7 @@ browser.Host = class {
 
                 await this._renderPanels(model1, model2, differences);
                 
-                // this._view.enableScrollSync();
+                this._view.enableScrollSync();
                 this._view.show(null)
             } else {
                 console.log('At least one model file must be selected for comparison.');

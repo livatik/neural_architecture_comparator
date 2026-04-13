@@ -30,6 +30,8 @@ view.View = class {
         this._sidebar = new view.Sidebar(this._host);
         this._differences = null;
         this._find = null;
+        this._scrollSync = null;
+        this._scrollSyncEnabled = true;
     }
 
     _element(id) {
@@ -163,6 +165,11 @@ view.View = class {
                     accelerator: 'CmdOrCtrl+M',
                     execute: () => this.toggle('mousewheel'),
                     enabled: () => !this._arePanelsEmpty()
+                });
+                view.add({
+                    label: () => this._scrollSyncEnabled ? 'Disable &Auto-Scroll Sync' : 'Enable &Auto-Scroll Sync',
+                    execute: () => this.toggleScrollSync(),
+                    enabled: () => !this._panels[0].isPanelEmpty() && !this._panels[1].isPanelEmpty()
                 });
                 view.add({});
                 if (this._host.type === 'Electron') {
@@ -305,17 +312,25 @@ view.View = class {
     }
 
     enableScrollSync() {
+        if (this._scrollSync) {
+            this._scrollSync.destroy();
+            this._scrollSync = null;
+        }
+        if (!this._scrollSyncEnabled) return;
         const panelLeft  = document.querySelector('#left-panel');
         const panelRight = document.querySelector('#right-panel');
+        if (!panelLeft || !panelRight) return;
+        this._scrollSync = createScrollSync({ panelA: panelLeft, panelB: panelRight });
+    }
 
-        const sync = createScrollSync({
-            panelA: panelLeft,
-            panelB: panelRight,
-            nodeSelector: '[data-node-id]',
-            align: 'relative',                           // 'top' or 'relative'
-            offset: 0,                              // add px if you have sticky headers
-            smooth: false                           // set true if you want smooth follower
-        });
+    toggleScrollSync() {
+        this._scrollSyncEnabled = !this._scrollSyncEnabled;
+        if (this._scrollSyncEnabled) {
+            this.enableScrollSync();
+        } else if (this._scrollSync) {
+            this._scrollSync.destroy();
+            this._scrollSync = null;
+        }
     }
 
     async attach(context, modelId) {
@@ -7777,194 +7792,102 @@ doubleSidebar.DoubleNodeSidebar = class extends doubleSidebar.DoubleObjectSideba
 
 
 /**
- * Sync scroll between two panels by aligning on the top-most visible node
- * that has a data-node-id. When one panel scrolls, the other panel scrolls
- * to the node with the same data-node-id.
+ * Sync scroll between two panels by matched-node alignment.
+ * Finds the topmost visible matched node in the source panel (identified by [data-node-id])
+ * and scrolls the target so its counterpart sits at the same panel-relative vertical offset.
+ * Matched nodes share the same data-node-id value across both panels.
+ * Falls back to proportional sync when no matched node is visible.
  *
  * @param {Object} options
  * @param {HTMLElement} options.panelA
  * @param {HTMLElement} options.panelB
- * @param {string} [options.nodeSelector='.node[data-node-id]'] - Selector used to find node elements
- * @param {'top'|'relative'} [options.align='top'] - Align matched node at panel top or preserve relative offset
- * @param {number} [options.offset=0] - Extra px offset to apply when aligning (e.g., account for sticky headers)
- * @param {boolean} [options.smooth=false] - Smooth scroll on the follower panel
  */
-function createScrollSync({
-    panelA,
-    panelB,
-    nodeSelector = '[data-node-id]',
-    align = 'top',
-    offset = 0,
-    smooth = false
-}) {
+function createScrollSync({ panelA, panelB }) {
     if (!panelA || !panelB) {
-        throw new Error('createScrollSync: panelA and panelB are required.');
+        throw new Error("createScrollSync: panelA and panelB are required.");
     }
 
-    // Escape helper for attribute values in selectors
-    const esc = (v) => (window.CSS && CSS.escape ? CSS.escape(String(v)) : String(v).replace(/['"\\]/g, '\\$&'));
+    // Panels being programmatically scrolled — their scroll events are suppressed.
+    const animating = new Set();
+    let animTimerA = 0, animTimerB = 0;
+    let rafIdA = 0, rafIdB = 0;
 
-    // Find all nodes in a panel (live query each time to support dynamic content)
-    const getNodes = (panel) => Array.from(panel.querySelectorAll(nodeSelector));
-
-    // Compute element top relative to the panel’s content box (not the page)
-    const relTop = (panel, el) => el.getBoundingClientRect().top - panel.getBoundingClientRect().top;
-
-    // Compute element offsetTop relative to panel scroll origin (content scrollTop target)
-    const offsetTopWithin = (panel, el) => {
-        let y = 0;
-        let node = el;
-        // Walk up until we hit the panel or the root; include offsetTop only while inside panel
-        while (node && node !== panel) {
-        y += node.offsetTop || 0;
-        node = node.offsetParent;
-        }
-        return y;
-    };
-
-    // Find the top-most visible (or just-above) node with data-node-id in this panel
-    function findTopNode(panel) {
-        const nodes = getNodes(panel);
-        if (!nodes.length) return null;
-
-        let best = null;
-        let bestTop = +Infinity;
-
-        for (const n of nodes) {
-        const t = relTop(panel, n);
-        // Prefer nodes at/just below the top (t >= 0 and minimal),
-        // else fallback to the closest just above top (largest negative).
-        const candidateScore = t >= 0 ? t : Math.abs(t) + 10000; // bias negatives lower priority
-        if (candidateScore < bestTop) {
-            bestTop = candidateScore;
-            best = n;
-        }
-        }
-        return best;
-    }
-
-    // Scroll target panel so that `targetNode` aligns per chosen mode.
-    function alignPanelToNode(targetPanel, targetNode, sourcePanel, sourceNode) {
-        if (!sourcePanel || !sourceNode || !targetPanel || !targetNode) return;
-
-        const prefersReducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
-        const behavior = smooth && !prefersReducedMotion ? 'smooth' : 'auto';
-
-        // Clamp helper
-        const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+    function doScroll(targetPanel, next) {
         const maxScroll = Math.max(0, targetPanel.scrollHeight - targetPanel.clientHeight);
-
-        let desiredScrollTop;
-
-        if (align === 'relative') {
-            // Keep the same relative top offset in both panels
-            const sourceRel = relTop(sourcePanel, sourceNode);
-            const targetRel = relTop(targetPanel, targetNode);
-
-            // We want targetNode to end up where sourceRel is inside targetPanel.
-            // Move by the delta between current targetRel and desired sourceRel.
-            const delta = (targetRel - sourceRel) - offset;
-            desiredScrollTop = clamp(targetPanel.scrollTop + delta, 0, maxScroll);
-
-        } else if (align === 'top') {
-            // Snap targetNode's top to the top of targetPanel (minus optional offset)
-            const targetAbs = offsetTopWithin(targetPanel, targetNode);
-            desiredScrollTop = clamp(targetAbs - offset, 0, maxScroll);
-
+        next = Math.max(0, Math.min(next, maxScroll));
+        if (Math.abs(next - targetPanel.scrollTop) < 0.5) return;
+        animating.add(targetPanel);
+        if (targetPanel === panelA) {
+            clearTimeout(animTimerA);
+            animTimerA = setTimeout(() => animating.delete(panelA), 100);
         } else {
-            // Fallback to relative if an unknown align value was passed
-            const sourceRel = relTop(sourcePanel, sourceNode);
-            const targetRel = relTop(targetPanel, targetNode);
-            const delta = (targetRel - sourceRel) - offset;
-            desiredScrollTop = clamp(targetPanel.scrollTop + delta, 0, maxScroll);
+            clearTimeout(animTimerB);
+            animTimerB = setTimeout(() => animating.delete(panelB), 100);
         }
-        
-        targetPanel.scrollTo({ top: desiredScrollTop, behavior });
+        targetPanel.scrollTo({ top: next, behavior: 'auto' });
     }
 
-    // Prevent feedback loops by tracking the active source
-    let isSyncing = false;
-    let rafIdA = 0;
-    let rafIdB = 0;
-
-    function onScrollFactory(sourcePanel, targetPanel) {
-        return function onScroll() {
-        if (isSyncing) return;               // ignore if we're currently programmatically syncing
-        if (sourcePanel === null || targetPanel === null) return;
-
-        // Throttle using rAF
-        const scheduleId = sourcePanel === panelA ? 'A' : 'B';
-        if (scheduleId === 'A') {
-            cancelAnimationFrame(rafIdA);
-            rafIdA = requestAnimationFrame(() => sync(sourcePanel, targetPanel));
-        } else {
-            cancelAnimationFrame(rafIdB);
-            rafIdB = requestAnimationFrame(() => sync(sourcePanel, targetPanel));
+    // Return the topmost partially-visible [data-node-id] element in panel.
+    function findAnchor(panel) {
+        const panelRect = panel.getBoundingClientRect();
+        let anchor = null;
+        let bestDist = Infinity;
+        for (const el of panel.querySelectorAll('[data-node-id]')) {
+            const rect = el.getBoundingClientRect();
+            if (rect.bottom < panelRect.top || rect.top > panelRect.bottom) continue;
+            const dist = Math.max(0, rect.top - panelRect.top);
+            if (dist < bestDist) { bestDist = dist; anchor = el; }
         }
-        };
+        return anchor;
     }
 
-    function sync(sourcePanel, targetPanel) {
-        const topNode = findTopNode(sourcePanel);
-        if (!topNode) return;
-        const nodeId = topNode.getAttribute('data-node-id');
-        if (!nodeId) return;
-
-        const match = targetPanel.querySelector(`[data-node-id="${esc(nodeId)}"]`);
-        if (!match) {
-        // Fallback: try to find next sibling in source that exists in target
-        const sourceNodes = getNodes(sourcePanel);
-        const idx = sourceNodes.indexOf(topNode);
-        for (let i = idx + 1; i < sourceNodes.length; i++) {
-            const nid = sourceNodes[i].getAttribute('data-node-id');
-            if (!nid) continue;
-            const candidate = targetPanel.querySelector(`[data-node-id="${esc(nid)}"]`);
-            if (candidate) {
-            isSyncing = true;
-            alignPanelToNode(targetPanel, candidate, sourcePanel, sourceNodes[i]);
-            isSyncing = false;
-            return;
+    function alignedSync(sourcePanel, targetPanel) {
+        const anchor = findAnchor(sourcePanel);
+        if (anchor) {
+            const nodeId = anchor.getAttribute('data-node-id');
+            const matchEl = targetPanel.querySelector(`[data-node-id="${CSS.escape(nodeId)}"]`);
+            if (matchEl) {
+                // Scroll target so matchEl appears at the same offset from the panel top as anchor.
+                const anchorRelTop = anchor.getBoundingClientRect().top
+                    - sourcePanel.getBoundingClientRect().top;
+                const matchAbsTop = matchEl.getBoundingClientRect().top
+                    - targetPanel.getBoundingClientRect().top
+                    + targetPanel.scrollTop;
+                doScroll(targetPanel, matchAbsTop - anchorRelTop);
+                return;
             }
         }
-        // Or previous
-        for (let i = idx - 1; i >= 0; i--) {
-            const nid = sourceNodes[i].getAttribute('data-node-id');
-            if (!nid) continue;
-            const candidate = targetPanel.querySelector(`[data-node-id="${esc(nid)}"]`);
-            if (candidate) {
-            isSyncing = true;
-            alignPanelToNode(targetPanel, candidate, sourcePanel, sourceNodes[i]);
-            isSyncing = false;
-            return;
-            }
-        }
-        // If nothing matches, do nothing
-        return;
-        }
-
-        isSyncing = true;
-        alignPanelToNode(targetPanel, match, sourcePanel, topNode);
-        isSyncing = false;
+        // Fallback: proportional sync.
+        const maxSrc = Math.max(1, sourcePanel.scrollHeight - sourcePanel.clientHeight);
+        const maxTgt = Math.max(0, targetPanel.scrollHeight - targetPanel.clientHeight);
+        doScroll(targetPanel, (sourcePanel.scrollTop / maxSrc) * maxTgt);
     }
 
-    // Attach listeners (passive for perf)
-    const listenerA = onScrollFactory(panelA, panelB);
-    const listenerB = onScrollFactory(panelB, panelA);
+    function listenerA() {
+        if (animating.has(panelA)) return;
+        cancelAnimationFrame(rafIdA);
+        rafIdA = requestAnimationFrame(() => alignedSync(panelA, panelB));
+    }
+
+    function listenerB() {
+        if (animating.has(panelB)) return;
+        cancelAnimationFrame(rafIdB);
+        rafIdB = requestAnimationFrame(() => alignedSync(panelB, panelA));
+    }
 
     panelA.addEventListener('scroll', listenerA, { passive: true });
     panelB.addEventListener('scroll', listenerB, { passive: true });
 
-    // Public API for teardown / refresh
     return {
         destroy() {
-        panelA.removeEventListener('scroll', listenerA);
-        panelB.removeEventListener('scroll', listenerB);
-        cancelAnimationFrame(rafIdA);
-        cancelAnimationFrame(rafIdB);
-        },
-        // If dynamic content changes frequently, you can call sync explicitly:
-        syncFromA() { sync(panelA, panelB); },
-        syncFromB() { sync(panelB, panelA); }
+            panelA.removeEventListener('scroll', listenerA);
+            panelB.removeEventListener('scroll', listenerB);
+            cancelAnimationFrame(rafIdA);
+            cancelAnimationFrame(rafIdB);
+            clearTimeout(animTimerA);
+            clearTimeout(animTimerB);
+            animating.clear();
+        }
     };
 }
 
