@@ -7827,6 +7827,20 @@ function createScrollSync({ panelA, panelB }) {
         targetPanel.scrollTo({ top: next, behavior: 'auto' });
     }
 
+    // Track the pair of nodes currently highlighted as the sync anchor.
+    const SYNC_HALO = 'node-sync-halo';
+    let haloAnchor = null;
+    let haloMatch  = null;
+
+    function setHalo(anchor, match) {
+        if (haloAnchor) haloAnchor.classList.remove(SYNC_HALO);
+        if (haloMatch)  haloMatch.classList.remove(SYNC_HALO);
+        haloAnchor = anchor ?? null;
+        haloMatch  = match  ?? null;
+        if (haloAnchor) haloAnchor.classList.add(SYNC_HALO);
+        if (haloMatch)  haloMatch.classList.add(SYNC_HALO);
+    }
+
     // Return the topmost partially-visible [data-node-id] element in panel.
     function findAnchor(panel) {
         const panelRect = panel.getBoundingClientRect();
@@ -7854,10 +7868,12 @@ function createScrollSync({ panelA, panelB }) {
                     - targetPanel.getBoundingClientRect().top
                     + targetPanel.scrollTop;
                 doScroll(targetPanel, matchAbsTop - anchorRelTop);
+                setHalo(anchor, matchEl);
                 return;
             }
         }
-        // Fallback: proportional sync.
+        // Fallback: proportional sync — no specific node pair to highlight.
+        setHalo(null, null);
         const maxSrc = Math.max(1, sourcePanel.scrollHeight - sourcePanel.clientHeight);
         const maxTgt = Math.max(0, targetPanel.scrollHeight - targetPanel.clientHeight);
         doScroll(targetPanel, (sourcePanel.scrollTop / maxSrc) * maxTgt);
@@ -7880,6 +7896,7 @@ function createScrollSync({ panelA, panelB }) {
 
     return {
         destroy() {
+            setHalo(null, null);
             panelA.removeEventListener('scroll', listenerA);
             panelB.removeEventListener('scroll', listenerB);
             cancelAnimationFrame(rafIdA);

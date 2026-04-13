@@ -66,6 +66,8 @@
 
 .node-default.node-match-highlight > path { fill: #CED4DA; }
 .node-different.node-match-highlight > path { fill: #D39E00; }
+
+.node-sync-halo { filter: drop-shadow(0 0 6px rgba(59,130,246,0.95)) drop-shadow(0 0 16px rgba(59,130,246,0.55)); }
 .node-added:hover > path { fill: #28A745; }
 .node-removed:hover > path { fill: #C82333; }
 
