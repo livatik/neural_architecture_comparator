@@ -71,7 +71,7 @@ button { font-family: -apple-system, BlinkMacSystemFont, "Segoe WPC", "Segoe UI"
 .logo-message, .about-message { display: none; height: 0px; }
 .logo-github { display: none; }
 
-.compare-models-button { top: 170px; left: 0px; width: 15.5em; }
+.compare-models-button { top: 170px; left: 0px; min-width: 20em; padding: 0 1.4em; }
 .progress { top: 120px; height: 2px; width: 400px; }
 .progress-bar { height: 100%; width: 0%; background-color: #444444; }
 .notification .logo-name { display: none; }
@@ -199,8 +199,8 @@ label[for="model-file-2"]:hover { background-color: #a78bfa; color: #1e1e1e; }
 .menu .menu-group .menu-separator { border-color: #363636; }
 }
 @media all and (max-width: 640px) {
-.logo { width: 240px; }
-.logo-text { opacity: 0; }
+.logo { width: min(96vw, 500px); }
+.logo-text { width: 100%; top: -30px; }
 .logo-name { opacity: 0; }
 .logo-icon { left: 0; width: 128px; height: 128px;  }
 .logo-spinner { left: 0; width: 128px; height: 128px; }
@@ -210,6 +210,7 @@ label[for="model-file-2"]:hover { background-color: #a78bfa; color: #1e1e1e; }
 .about .logo { width: 100%; padding-left: 0; padding-right: 0; }
 .about .logo-message { top: 175px; font-size: 12px; }
 .about .logo-github { top: 370px; }
+.model-inputs-row { flex-direction: column; }
 }
 .sidebar { display: flex; flex-direction: column; font-family: -apple-system, BlinkMacSystemFont, "Segoe WPC", "Segoe UI", "Ubuntu", "Droid Sans", sans-serif; font-size: 12px; height: 100%; right: -100%; position: fixed; transition: 0.1s; top: 0; background-color: #ececec; color: #242424; overflow: hidden; border-left: 1px solid rgba(255, 255, 255, 0.5); opacity: 0; }
 .sidebar-title { font-weight: bold; font-size: 12px; letter-spacing: 0.5px; text-transform: uppercase; height: 20px; margin: 0; padding: 20px; user-select: none; -webkit-user-select: none; -moz-user-select: none; }
@@ -403,7 +404,7 @@ label[for="model-file-2"]:hover { background-color: #a78bfa; color: #1e1e1e; }
 
 .model-inputs-row {
     display: flex;
-    flex-direction: row;
+    flex-wrap: wrap;
     gap: 10px;
 }
 .about-message {
@@ -555,7 +556,6 @@ label[for="model-file-2"]:hover { background-color: #a78bfa; color: #1e1e1e; }
 
         <!-- Compare button + file inputs -->
         <div class="compare-container">
-            <button id="compare-models-button" class="logo-button compare-models-button" tabindex="0">Compare Models…</button>
             <div class="model-inputs-row">
                 <label for="model-file-1" class="file-input">
                     <span id="label-text-model-file-1">Select Model A</span>
@@ -566,6 +566,7 @@ label[for="model-file-2"]:hover { background-color: #a78bfa; color: #1e1e1e; }
                 </label>
                 <input type="file" id="model-file-2" style="display:none;" />
             </div>
+            <button id="compare-models-button" class="logo-button compare-models-button" tabindex="0">Compare Models…</button>
         </div>
         <div class="progress">
             <div id="progress-bar" class="progress-bar"></div>
