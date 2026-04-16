@@ -614,7 +614,7 @@ diffAnalyser.ModelNodesDiffAnalyzer = class {
 diffAnalyser.SoftModelNodesDiffAnalyzer = class {
 
     // ----------------------------- Constants -----------------------------
-    static FEATURE_DIM = 19;
+    static FEATURE_DIM = 27;
     static MESSAGE_PASS_ROUNDS = 2;
     static SOFT_MATCH_THRESHOLD = 0.35;
     static EXPANSION_THRESHOLD = 0.25;
@@ -1046,9 +1046,12 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
 
         const MNA        = diffAnalyser.ModelNodesDiffAnalyzer;
         const NUM_GROUPS = 7;  // named groups 0–6; slot 7 = unknown bucket
-        const LOG_SCALE  = 12; // log2(1 + 4096) ≈ 12 — covers spatial dims up to 4096
+        const LOG_SPATIAL = 13; // log2(1 + 8192) ≈ 13 — covers spatial/sequence dims up to 8192
+        const LOG_CHANNEL = 11; // log2(1 + 2048) ≈ 11 — covers channel dims up to 2048
 
-        // Ordinal rank within same type, sorted by topoRank, normalised by MAX_TYPE_COUNT.
+        // Ordinal rank within same type, sorted by topoRank.
+        // Normalised by (count - 1) so first=0 and last=1 regardless of how many instances exist.
+        // A single-instance type gets rank 0.
         const typeRelRank = new Map();
         const byType = new Map();
         for (const node of nodes) {
@@ -1058,7 +1061,8 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
         }
         for (const group of byType.values()) {
             group.sort((a, b) => (topo.topoRank.get(a) ?? 0) - (topo.topoRank.get(b) ?? 0));
-            group.forEach((node, i) => typeRelRank.set(node, i / this.MAX_TYPE_COUNT));
+            const denom = Math.max(1, group.length - 1);
+            group.forEach((node, i) => typeRelRank.set(node, i / denom));
         }
 
         // Multi-hot: set a bit for each compatibility group present among the given neighbours.
@@ -1084,15 +1088,23 @@ diffAnalyser.SoftModelNodesDiffAnalyzer = class {
             vec[1] = (topo.outDegree.get(node) ?? 0) / maxDeg;
             vec[2] = (topo.topoRank.get(node)  ?? 0) / maxRank;
             vec[3] = typeRelRank.get(node) ?? 0;
-            vec[4] = Math.log2(1 + width)    / LOG_SCALE;
-            vec[5] = Math.log2(1 + height)   / LOG_SCALE;
-            vec[6] = Math.log2(1 + channels) / LOG_SCALE;
-            // vec[7..14]  — multi-hot parent (input) groups
+            vec[4] = Math.log2(1 + width)    / LOG_SPATIAL;
+            vec[5] = Math.log2(1 + height)   / LOG_SPATIAL;
+            vec[6] = Math.log2(1 + channels) / LOG_CHANNEL;
+            // vec[7..14]  — multi-hot parent (input) compatibility groups
             neighborGroupBits(topo.parentMap.get(node) ?? [], vec, 7);
             vec[15] = ks0             !== null ? Math.min(ks0,             32)   / 32   : 0;
             vec[16] = stride          !== null ? Math.min(stride,          8)    / 8    : 0;
             vec[17] = depthMultiplier !== null ? Math.min(depthMultiplier, 32)   / 32   : 0;
             vec[18] = outCh           !== null ? Math.min(outCh,           4096) / 4096 : 0;
+            // vec[19..26] — one-hot for this node's own compatibility group.
+            {
+                const tn      = MNA._getNodeTypeName(node) ?? '__unknown__';
+                const idx     = vocab.typeToIdx.get(tn) ?? 0;
+                const grp     = compatGroups[idx];
+                const ownSlot = grp < NUM_GROUPS ? grp : NUM_GROUPS;
+                vec[19 + ownSlot] = 1;
+            }
 
             fmap.set(node, vec);
         }
